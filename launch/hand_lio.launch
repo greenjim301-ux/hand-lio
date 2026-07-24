@@ -1,0 +1,4 @@
+<launch>
+    <rosparam file="$(find hand_lio)/config/hand_lio.yaml" command="load" ns="hand_lio_node"/>
+    <node pkg="hand_lio" type="hand_lio_node" name="hand_lio_node" output="screen"/>
+</launch>

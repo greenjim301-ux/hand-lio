@@ -18,27 +18,14 @@ find_package(catkin REQUIRED COMPONENTS
         tf2_ros
         pcl_ros
         pcl_conversions
-        message_generation
 )
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io)
 
-add_message_files(
-        DIRECTORY msg
-        FILES
-        CustomMsg.msg   # 与 /livox/lidar (livox_ros_driver::CustomMsg) 逐字段一致
-        CustomPoint.msg
-)
-
-generate_messages(
-        DEPENDENCIES
-        std_msgs
-)
-
 catkin_package(
         INCLUDE_DIRS include
-        CATKIN_DEPENDS roscpp nav_msgs sensor_msgs std_msgs geometry_msgs tf2_ros message_runtime
+        CATKIN_DEPENDS roscpp nav_msgs sensor_msgs std_msgs geometry_msgs tf2_ros
         DEPENDS EIGEN3 PCL
 )
 

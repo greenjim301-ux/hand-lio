@@ -4,9 +4,9 @@
   <name>hand_lio</name>
   <version>0.1.0</version>
   <description>
-    Subscribes to HandBot-S1's /livox/lidar and /latest_imu_odom, deskews each point using an
-    interpolated pose at its own capture time, and republishes the point cloud already expressed
-    in the world frame.
+    Bridges Elevator-LIO's deskewed local-world point cloud into the global relocalization frame
+    of /latest_imu_odom: pairs the two pose streams by timestamp to estimate the slowly-varying
+    inter-frame correction T_map_elio, then republishes the cloud in the map frame.
   </description>
   <maintainer email="greenjim301@gmail.com">greenjim301</maintainer>
   <license>GPL-2.0-or-later</license>
@@ -29,11 +29,6 @@
   <exec_depend>tf2_ros</exec_depend>
   <build_depend>geometry_msgs</build_depend>
   <exec_depend>geometry_msgs</exec_depend>
-
-  <build_depend>message_generation</build_depend>
-  <exec_depend>message_generation</exec_depend>
-  <build_depend>message_runtime</build_depend>
-  <exec_depend>message_runtime</exec_depend>
 
   <export>
     <build_type>catkin</build_type>

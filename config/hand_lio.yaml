@@ -1,35 +1,44 @@
 # hand_lio_node 参数配置
 # 通过 launch/hand_lio.launch 以 private (~) 命名空间加载
+#
+# 节点职责（详见 include/hand_lio/HandLioNode.h 头部注释）：
+#   把 Elevator-LIO 输出的局部 world 系去畸变点云，用 /latest_imu_odom（全局重定位系）
+#   与 Elevator-LIO odom_imu 按时间戳配对算出的系间修正 T_map_elio，桥接到全局 map 系
+#   再以 /hand_lio/clouds_lidar 发布给 SCAN-Planner。
 
-lidar_topic: /livox/lidar
-odom_topic: /latest_imu_odom
-output_topic: /LIO/clouds_lidar
-vehicle_odom_topic: /LIO/odom_vehicle # 跟 Elevator-LIO 同名，给 SCAN-Planner 这类下游直接当替代源用
+# ---- 话题 ----
+# 输入侧直接用 Elevator-LIO 的默认话题名（/LIO/*，见其 yaml/runtime/mapping.yaml、
+# relocation.yaml 的 topic_pub 段），Elevator-LIO 不需要任何改动；本节点的产出统一挂
+# /hand_lio 前缀避免撞名。下游（SCAN-Planner 的 run.launch）要把 cloud_topic /
+# body_pose_topic 指到 /hand_lio/* 上。
+odom_topic: /latest_imu_odom # 手持设备全局重定位位姿，map->imu，200Hz，见 hand-topic.csv
+elio_odom_topic: /LIO/odom_imu # Elevator-LIO 的 imu 里程计，elio-world->imu
+elio_cloud_topic: /LIO/clouds_lidar # Elevator-LIO 的去畸变点云，elio-world 系
+output_topic: /hand_lio/clouds_lidar # 桥接到全局 map 系后的点云
+vehicle_odom_topic: /hand_lio/odom_vehicle # 由 /latest_imu_odom 合成的机体位姿
 world_frame_id: world
 vehicle_frame_id: body
 
-blind:
-  0.8 # 盲区半径 [m]，靠近雷达中心的点直接丢弃
-  # Mid-360 硬件本身盲区只有 0.1~0.2m，但 Elevator-LIO 的
-  # mapping.yaml / relocation.yaml 实际用的是 0.8——多出来的部分
-  # 是机器人自身支架/外壳造成的自遮挡，跟着同款硬件的实测值走更靠谱
-point_filter_num: 1 # 每隔几个有效点保留一个，1 表示全部保留
+# ---- 位姿缓冲与质量把关 ----
+buffer_horizon_sec: 2.0 # 两条位姿流的缓冲时长 [s]
+pose_cov_reject_thresh: 0.99 # covariance[0] 达到该值视为定位失败（见 hand-topic.csv）：冻结修正量并丢弃点云
 
-buffer_horizon_sec: 2.0 # /latest_imu_odom 位姿缓冲时长 [s]，需覆盖至少一帧点云的扫描时长
-pose_cov_reject_thresh: 0.99 # covariance[0] 达到该值视为定位失败（见 hand-topic.csv），丢弃该帧
+# ---- 系间修正 T_map_elio ----
+# 修正量只随 Elevator-LIO 的漂移变化，是慢变量，所以 /latest_imu_odom 的滞后无害：
+# 用"稍旧"的修正量转换刚到的点云，误差只是滞后时段内的漂移增量。
+correction_smooth_tau: 0.5 # 指数平滑时间常数 [s]，压掉两侧估计的抖动
+correction_jump_pos: 0.5 # 平移跳变阈值 [m]：单次配对偏离超过它视为全局重定位修正，直接跟上不平滑
+correction_jump_ang_deg: 10.0 # 旋转跳变阈值 [deg]，同上
+correction_timeout_sec: 1.0 # 修正量过期时长 [s]：/latest_imu_odom 断流或持续定位失败超过它就丢弃点云
 
-# Livox 原始点 tag/line 质量过滤，跟 Elevator-LIO 一样无条件开启（不留开关）。
-# n_scans=4 是 Mid-360 专属值：官方 livox_ros_driver2 源码 src/comm/comm.h 里
-# kLineNumberMid360 = 4（HAP 是 6，其余机型默认 1），line 字段实际取值范围是 0~3。
-# tag 位掩码 0x30 的含义是 Livox 协议级定义、和具体雷达型号无关，不用改。
-n_scans: 4
-
-# 雷达 -> IMU 外参。
+# ---- 外参：lidar -> IMU ----
 # 取自 Elevator-LIO 的 yaml/sensors/livox.yaml（同款 Mid-360 硬件），并与 hku-mars/FAST_LIO
 # 官方仓库 config/mid360.yaml 的 extrinsic_T/extrinsic_R 交叉核对完全一致——这是 Mid-360
 # 内置 IMU 相对雷达原点的出厂固定偏移，社区里用同一颗 Mid-360 内置 IMU 的项目基本都是这套值。
 # 前提：/latest_imu_odom 的 "imu" 是 Mid-360 自带的那颗内置 IMU（即 /livox/imu 的来源），
 # 而不是外挂的独立 IMU；如果 HandBot-S1 实际用的是外接 IMU，这组值就不适用，需要重新标定。
+# 同一前提也保证了 /latest_imu_odom 和 Elevator-LIO odom_imu 是同一颗 IMU 的位姿，
+# 系间配对不需要额外外参。仅用于合成 /hand_lio/odom_vehicle。
 # 行优先 3x3 旋转矩阵 + 平移向量，满足 p_imu = imu_R_lidar * p_lidar + imu_t_lidar
 # prettier-ignore
 imu_R_lidar: [1.0, 0.0, 0.0,
@@ -37,10 +46,10 @@ imu_R_lidar: [1.0, 0.0, 0.0,
               0.0, 0.0, 1.0]
 imu_t_lidar: [-0.011, -0.02329, 0.04412]
 
-# 雷达 -> 机体(小车中心) 外参，用于合成 /LIO/odom_vehicle。
+# ---- 外参：lidar -> 机体(小车中心)，用于合成 /hand_lio/odom_vehicle ----
 # 跟上面 imu_R_lidar/imu_t_lidar 不同，这个是 HandBot-S1 底盘特有的机械安装关系
 # （雷达装在小车上的具体位置），Elevator-LIO 的值是它自己那台车的，不能照抄，
-# 官方资料也不可能给——现在还是占位单位阵，必须自己标定后才能让 /LIO/odom_vehicle
+# 官方资料也不可能给——现在还是占位单位阵，必须自己标定后才能让 /hand_lio/odom_vehicle
 # 的位置数值有意义，键名对齐 Elevator-LIO 的 yaml/sensors/livox.yaml。
 # 行优先 3x3 旋转矩阵 + 平移向量，满足 p_lidar = lidar_R_body * p_body + lidar_t_body
 # prettier-ignore

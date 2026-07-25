@@ -1,9 +1,11 @@
 #include "hand_lio/HandLioNode.h"
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 #include <geometry_msgs/TransformStamped.h>
+#include <pcl/common/transforms.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
@@ -56,35 +58,42 @@ namespace hand_lio
             ROS_WARN("[hand_lio] lidar_t_body size != 3, fallback to zero");
         }
 
-        pnh.param("blind", blind_, blind_);
-        pnh.param("point_filter_num", point_filter_num_, point_filter_num_);
         pnh.param("buffer_horizon_sec", buffer_horizon_sec_, buffer_horizon_sec_);
         pnh.param("pose_cov_reject_thresh", pose_cov_reject_thresh_, pose_cov_reject_thresh_);
+        pnh.param("correction_smooth_tau", correction_smooth_tau_, correction_smooth_tau_);
+        pnh.param("correction_jump_pos", correction_jump_pos_, correction_jump_pos_);
+        pnh.param("correction_jump_ang_deg", correction_jump_ang_deg_, correction_jump_ang_deg_);
+        pnh.param("correction_timeout_sec", correction_timeout_sec_, correction_timeout_sec_);
         pnh.param("world_frame_id", world_frame_id_, world_frame_id_);
         pnh.param("vehicle_frame_id", vehicle_frame_id_, vehicle_frame_id_);
-        pnh.param("n_scans", n_scans_, n_scans_);
 
-        std::string lidar_topic = "/livox/lidar";
         std::string odom_topic = "/latest_imu_odom";
-        std::string output_topic = "/hand_lio/clouds_world";
-        std::string vehicle_odom_topic = "/LIO/odom_vehicle";
-        pnh.param("lidar_topic", lidar_topic, lidar_topic);
+        std::string elio_odom_topic = "/LIO/odom_imu";
+        std::string elio_cloud_topic = "/LIO/clouds_lidar";
+        std::string output_topic = "/hand_lio/clouds_lidar";
+        std::string vehicle_odom_topic = "/hand_lio/odom_vehicle";
         pnh.param("odom_topic", odom_topic, odom_topic);
+        pnh.param("elio_odom_topic", elio_odom_topic, elio_odom_topic);
+        pnh.param("elio_cloud_topic", elio_cloud_topic, elio_cloud_topic);
         pnh.param("output_topic", output_topic, output_topic);
         pnh.param("vehicle_odom_topic", vehicle_odom_topic, vehicle_odom_topic);
 
-        // /latest_imu_odom 200Hz，缓冲队列要能跟上；/livox/lidar 10Hz。
-        odom_sub_ = nh.subscribe(odom_topic, 2000, &HandLioNode::odomCallback, this);
-        lidar_sub_ = nh.subscribe(lidar_topic, 10, &HandLioNode::lidarCallback, this);
+        // /latest_imu_odom 200Hz，缓冲队列要能跟上；Elevator-LIO 的话题跟随每帧 lidar ~10Hz
+        //（high_frequency_odom 开启时 odom_imu 会更高频，队列给足余量）。
+        map_odom_sub_ = nh.subscribe(odom_topic, 2000, &HandLioNode::mapOdomCallback, this);
+        elio_odom_sub_ = nh.subscribe(elio_odom_topic, 200, &HandLioNode::elioOdomCallback, this);
+        elio_cloud_sub_ = nh.subscribe(elio_cloud_topic, 10, &HandLioNode::elioCloudCallback, this);
         cloud_pub_ = nh.advertise<sensor_msgs::PointCloud2>(output_topic, 10);
         vehicle_odom_pub_ = nh.advertise<nav_msgs::Odometry>(vehicle_odom_topic, 200);
 
-        ROS_INFO_STREAM("[hand_lio] lidar_topic=" << lidar_topic << " odom_topic=" << odom_topic << " output_topic="
-                                                  << output_topic << " vehicle_odom_topic=" << vehicle_odom_topic
-                                                  << " world_frame_id=" << world_frame_id_);
+        ROS_INFO_STREAM("[hand_lio] odom_topic=" << odom_topic << " elio_odom_topic=" << elio_odom_topic
+                                                 << " elio_cloud_topic=" << elio_cloud_topic << " output_topic="
+                                                 << output_topic << " vehicle_odom_topic=" << vehicle_odom_topic
+                                                 << " world_frame_id=" << world_frame_id_);
     }
 
-    void HandLioNode::odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
+    bool HandLioNode::pushSample(std::deque<PoseSample> &buf, const nav_msgs::Odometry::ConstPtr &msg, double horizon,
+                                 const char *name)
     {
         PoseSample s;
         s.t = msg->header.stamp.toSec();
@@ -92,38 +101,36 @@ namespace hand_lio
         s.q = Eigen::Quaterniond(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
                                  msg->pose.pose.orientation.z);
         s.q.normalize();
-        // hand-topic.csv: covariance[0] 是定位方差，0.0~0.99，越大越不可信，0.99 表示定位失败
         s.cov0 = msg->pose.covariance[0];
 
+        bool cleared = false;
+        if (!buf.empty() && s.t <= buf.back().t)
         {
-            std::lock_guard<std::mutex> lock(odom_mutex_);
-            if (!odom_buf_.empty() && s.t <= odom_buf_.back().t)
-            {
-                // 时间戳回退（例如播包重播），历史插值区间已经不连续，清空重新累积
-                ROS_WARN_THROTTLE(1.0, "[hand_lio] /latest_imu_odom timestamp went backwards, clearing pose buffer");
-                odom_buf_.clear();
-            }
-            odom_buf_.push_back(s);
-            while (!odom_buf_.empty() && (s.t - odom_buf_.front().t) > buffer_horizon_sec_)
-            {
-                odom_buf_.pop_front();
-            }
-        } // odom_mutex_ 在此释放，publishVehicleOdom 不需要它
-
-        publishVehicleOdom(msg);
+            // 时间戳回退（播包重播/节点重启）：历史插值区间不连续，且发布方的坐标系
+            // 可能已经换了原点，清空重新累积
+            ROS_WARN_THROTTLE(1.0, "[hand_lio] %s timestamp went backwards, clearing pose buffer", name);
+            buf.clear();
+            cleared = true;
+        }
+        buf.push_back(s);
+        while (!buf.empty() && (s.t - buf.front().t) > horizon)
+        {
+            buf.pop_front();
+        }
+        return cleared;
     }
 
-    bool HandLioNode::interpolatePose(double t, PoseSample &out) const
+    bool HandLioNode::interpolatePose(const std::deque<PoseSample> &buf, double t, PoseSample &out)
     {
-        if (odom_buf_.size() < 2)
+        if (buf.size() < 2)
             return false;
-        if (t < odom_buf_.front().t || t > odom_buf_.back().t)
+        if (t < buf.front().t || t > buf.back().t)
             return false;
 
-        auto it = std::lower_bound(odom_buf_.begin(), odom_buf_.end(), t,
+        auto it = std::lower_bound(buf.begin(), buf.end(), t,
                                    [](const PoseSample &s, double tt)
                                    { return s.t < tt; });
-        if (it == odom_buf_.begin())
+        if (it == buf.begin())
         {
             out = *it;
             return true;
@@ -140,92 +147,132 @@ namespace hand_lio
         return true;
     }
 
-    void HandLioNode::lidarCallback(const CustomMsgConstPtr &msg)
+    void HandLioNode::mapOdomCallback(const nav_msgs::Odometry::ConstPtr &msg)
     {
-        const int point_num = static_cast<int>(msg->point_num);
-        if (point_num <= 1 || msg->points.empty())
+        {
+            std::lock_guard<std::mutex> lock(buf_mutex_);
+            if (pushSample(map_odom_buf_, msg, buffer_horizon_sec_, "/latest_imu_odom"))
+            {
+                correction_valid_ = false;
+            }
+            tryUpdateCorrection();
+        } // buf_mutex_ 在此释放，publishVehicleOdom 不需要它
+
+        publishVehicleOdom(msg);
+    }
+
+    void HandLioNode::elioOdomCallback(const nav_msgs::Odometry::ConstPtr &msg)
+    {
+        std::lock_guard<std::mutex> lock(buf_mutex_);
+        if (pushSample(elio_odom_buf_, msg, buffer_horizon_sec_, "elio odom_imu"))
+        {
+            correction_valid_ = false;
+        }
+        tryUpdateCorrection();
+    }
+
+    void HandLioNode::tryUpdateCorrection()
+    {
+        if (map_odom_buf_.size() < 2 || elio_odom_buf_.size() < 2)
             return;
 
-        const double base_time = msg->header.stamp.toSec();
-        const double end_time = base_time + static_cast<double>(msg->points.back().offset_time) * 1e-9;
+        // 配对时刻取两条流共同覆盖的最新时刻：/latest_imu_odom 滞后时它是 map_odom_buf_
+        // 的队尾（拿滞后消息查及时缓存，查过去总能查到——跟旧方案逐点查未来正相反）；
+        // 若某侧反而更旧，则退到那一侧队尾，插值区间依然两边都覆盖。
+        const double t_pair = std::min(map_odom_buf_.back().t, elio_odom_buf_.back().t);
+        if (correction_valid_ && t_pair <= correction_pair_t_)
+            return;
 
-        std::lock_guard<std::mutex> lock(odom_mutex_);
+        PoseSample map_pose, elio_pose;
+        if (!interpolatePose(map_odom_buf_, t_pair, map_pose) || !interpolatePose(elio_odom_buf_, t_pair, elio_pose))
+            return;
 
-        // 只要求覆盖到这一帧的起始时刻 base_time：end_time 约等于"此刻"，
-        // /latest_imu_odom 作为下游定位估计天然会比物理时刻滞后（计算耗时+网络延迟），
-        // 要求整帧覆盖到 end_time 会导致逐帧必然被丢弃。末尾这几毫秒对应的点在下面
-        // 逐点插值时会自然被跳过（interpolatePose 超出范围返回 false），不必在此整帧拒绝。
-        if (odom_buf_.empty() || odom_buf_.front().t > base_time || odom_buf_.back().t < base_time)
+        // 全局定位失败期间冻结修正量：继续沿用上一次的值，超过 correction_timeout_sec_
+        // 后由点云回调那侧兜底丢帧
+        if (map_pose.cov0 >= pose_cov_reject_thresh_)
         {
-            if (odom_buf_.empty())
+            ROS_WARN_THROTTLE(1.0, "[hand_lio] map localization covariance too high (%.3f >= %.3f), freeze correction",
+                              map_pose.cov0, pose_cov_reject_thresh_);
+            return;
+        }
+
+        // T_map_elio = map_T_imu(t) * elio_T_imu(t)^-1
+        const Eigen::Quaterniond q_new = (map_pose.q * elio_pose.q.conjugate()).normalized();
+        const Eigen::Vector3d p_new = map_pose.p - q_new * elio_pose.p;
+
+        if (!correction_valid_)
+        {
+            corr_q_ = q_new;
+            corr_p_ = p_new;
+            correction_valid_ = true;
+        }
+        else
+        {
+            const double pos_jump = (p_new - corr_p_).norm();
+            const double ang_jump_deg = corr_q_.angularDistance(q_new) * 180.0 / M_PI;
+            if (pos_jump > correction_jump_pos_ || ang_jump_deg > correction_jump_ang_deg_)
             {
-                ROS_WARN_THROTTLE(1.0, "[hand_lio] /latest_imu_odom buffer is empty, drop frame");
+                // 大幅跳变说明全局重定位刚修正过（这正是用 /latest_imu_odom 的意义所在），
+                // 平滑过渡反而会让点云在错误位置多停留一个时间常数，直接跟上
+                ROS_INFO("[hand_lio] correction jump detected (%.2fm / %.1fdeg), snapping to new value", pos_jump,
+                         ang_jump_deg);
+                corr_q_ = q_new;
+                corr_p_ = p_new;
             }
             else
             {
-                ROS_WARN_THROTTLE(1.0, "[hand_lio] /latest_imu_odom buffer time range [%.3f, %.3f] does not cover this lidar scan start time %.3f, drop frame",
-                                  odom_buf_.front().t, odom_buf_.back().t, base_time);
+                // 修正量只随 Elevator-LIO 的漂移变化，是慢变量，指数平滑压掉两侧估计的抖动
+                const double dt = t_pair - correction_pair_t_;
+                const double alpha = 1.0 - std::exp(-dt / std::max(correction_smooth_tau_, 1e-3));
+                corr_p_ = (1.0 - alpha) * corr_p_ + alpha * p_new;
+                corr_q_ = corr_q_.slerp(alpha, q_new).normalized();
             }
-            return;
         }
+        correction_pair_t_ = t_pair;
+    }
 
-        // 用缓冲区里最新的样本做定位质量把关（而不是插值到 end_time，理由同上）
-        const double latest_cov0 = odom_buf_.back().cov0;
-        if (latest_cov0 >= pose_cov_reject_thresh_)
+    void HandLioNode::elioCloudCallback(const sensor_msgs::PointCloud2::ConstPtr &msg)
+    {
+        Eigen::Quaterniond q;
+        Eigen::Vector3d p;
+        const double cloud_t = msg->header.stamp.toSec();
         {
-            ROS_WARN_THROTTLE(1.0, "[hand_lio] localization covariance too high (%.3f >= %.3f), drop frame", latest_cov0,
-                              pose_cov_reject_thresh_);
-            return;
+            std::lock_guard<std::mutex> lock(buf_mutex_);
+            if (!correction_valid_)
+            {
+                ROS_WARN_THROTTLE(1.0, "[hand_lio] no map<-elio correction yet, drop cloud");
+                return;
+            }
+            // 修正量过旧（/latest_imu_odom 断流或长时间定位失败）时，漂移增量不再可控，丢帧
+            if (cloud_t - correction_pair_t_ > correction_timeout_sec_)
+            {
+                ROS_WARN_THROTTLE(1.0, "[hand_lio] correction is stale (%.2fs > %.2fs), drop cloud",
+                                  cloud_t - correction_pair_t_, correction_timeout_sec_);
+                return;
+            }
+            if (!map_odom_buf_.empty() && map_odom_buf_.back().cov0 >= pose_cov_reject_thresh_)
+            {
+                ROS_WARN_THROTTLE(1.0, "[hand_lio] localization covariance too high (%.3f >= %.3f), drop cloud",
+                                  map_odom_buf_.back().cov0, pose_cov_reject_thresh_);
+                return;
+            }
+            q = corr_q_;
+            p = corr_p_;
         }
 
-        pcl::PointCloud<pcl::PointXYZI> cloud_world;
-        cloud_world.reserve(point_num);
-
-        uint32_t valid_num = 0;
-        for (int i = 1; i < point_num; ++i)
-        { // 第 0 个点跳过，Livox CustomMsg 的常见约定（同 Elevator-LIO）
-            const auto &pt = msg->points[i];
-
-            const bool tag_ok = (pt.tag & tag_mask_) == 0x10 || (pt.tag & tag_mask_) == 0x00;
-            if (!(pt.line < n_scans_ && tag_ok))
-                continue;
-
-            ++valid_num;
-            if (point_filter_num_ > 1 && (valid_num % point_filter_num_) != 0)
-                continue;
-
-            const double r2 = static_cast<double>(pt.x) * pt.x + static_cast<double>(pt.y) * pt.y +
-                              static_cast<double>(pt.z) * pt.z;
-            if (r2 <= blind_ * blind_)
-                continue;
-
-            const double t_point = base_time + static_cast<double>(pt.offset_time) * 1e-9;
-            PoseSample pose_i;
-            if (!interpolatePose(t_point, pose_i))
-                continue;
-
-            // 去畸变 + 转 world 系一步完成：用该点自己采集时刻的插值位姿直接变换
-            const Eigen::Vector3d p_lidar(pt.x, pt.y, pt.z);
-            const Eigen::Vector3d p_imu = imu_R_lidar_ * p_lidar + imu_t_lidar_;
-            const Eigen::Vector3d p_world = pose_i.q * p_imu + pose_i.p;
-
-            pcl::PointXYZI out_pt;
-            out_pt.x = static_cast<float>(p_world.x());
-            out_pt.y = static_cast<float>(p_world.y());
-            out_pt.z = static_cast<float>(p_world.z());
-            out_pt.intensity = static_cast<float>(pt.reflectivity);
-            cloud_world.push_back(out_pt);
-        }
-
-        if (cloud_world.empty())
+        // Elevator-LIO 的点是 PointXYZINormal，fromROSMsg 到 PointXYZI 只取 x/y/z/intensity，
+        // 多余字段自动忽略
+        pcl::PointCloud<pcl::PointXYZI> cloud;
+        pcl::fromROSMsg(*msg, cloud);
+        if (cloud.empty())
             return;
-        cloud_world.width = cloud_world.size();
-        cloud_world.height = 1;
-        cloud_world.is_dense = true;
+
+        const Eigen::Affine3f T = Eigen::Translation3f(p.cast<float>()) * q.cast<float>();
+        pcl::transformPointCloud(cloud, cloud, T);
 
         sensor_msgs::PointCloud2 out_msg;
-        pcl::toROSMsg(cloud_world, out_msg);
-        out_msg.header.stamp = ros::Time(end_time);
+        pcl::toROSMsg(cloud, out_msg);
+        out_msg.header.stamp = msg->header.stamp;
         out_msg.header.frame_id = world_frame_id_;
         cloud_pub_.publish(out_msg);
     }
@@ -264,13 +311,13 @@ namespace hand_lio
         odom_body.pose.pose.orientation.x = body_q.x();
         odom_body.pose.pose.orientation.y = body_q.y();
         odom_body.pose.pose.orientation.z = body_q.z();
-        // 定位质量透传给下游，而不是直接丢帧：/LIO/odom_vehicle 是持续反馈给规划/控制的话题，
+        // 定位质量透传给下游，而不是直接丢帧：odom_vehicle 是持续反馈给规划/控制的话题，
         // 静默断流比让下游自己判断 covariance[0] 风险更大。twist 保持全零，
         // 跟 Elevator-LIO::publish_body_odometry 实际行为一致（它也从没写过 twist 字段）。
         odom_body.pose.covariance[0] = msg->pose.covariance[0];
         if (msg->pose.covariance[0] >= pose_cov_reject_thresh_)
         {
-            ROS_WARN_THROTTLE(1.0, "[hand_lio] /LIO/odom_vehicle localization covariance too high (%.3f >= %.3f)",
+            ROS_WARN_THROTTLE(1.0, "[hand_lio] odom_vehicle localization covariance too high (%.3f >= %.3f)",
                               msg->pose.covariance[0], pose_cov_reject_thresh_);
         }
         vehicle_odom_pub_.publish(odom_body);

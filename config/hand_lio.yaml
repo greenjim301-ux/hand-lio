@@ -46,12 +46,19 @@ imu_R_lidar: [1.0, 0.0, 0.0,
 imu_t_lidar: [-0.011, -0.02329, 0.04412]
 
 # ---- 外参：lidar -> 机体(Go2 中心)，用于合成 /hand_lio/odom_vehicle ----
-# 跟上面 imu_R_lidar/imu_t_lidar 不同，这个是手持设备绑在 Go2 背上的机械安装关系，
-# 装好后必须自己标定——现在还是占位单位阵，标定前 /hand_lio/odom_vehicle 的位置
-# 是雷达位置而不是狗的机体中心。键名对齐 Elevator-LIO 的 yaml/sensors/livox.yaml。
+# 跟上面 imu_R_lidar/imu_t_lidar 不同，这个是手持设备绑在 Go2 背上的机械安装关系。
+# 键名对齐 Elevator-LIO 的 yaml/sensors/livox.yaml。
 # 行优先 3x3 旋转矩阵 + 平移向量，满足 p_lidar = lidar_R_body * p_body + lidar_t_body
+# 即平移向量 = 机体原点在雷达系下的坐标。雷达实测装在机体中心正上方 24cm，
+# xy 对齐无偏移，所以 t = (0, 0, -0.24)；旋转按雷达装平、朝向与机体一致取单位阵。
+#
+# 这一项直接决定 SCAN-Planner 的碰撞检测高度：它以 odom 位置为中心、上下各
+# obstacles_inflation_z_up/down(=0.1m) 取一层薄片做膨胀占据查询
+# (grid_map.h::getInflateOccupancy)。填 0 时 odom 报的是雷达位置(离地约 0.58m)，
+# 检测带落在 0.48~0.68m，整个躯干高度不设防；填 -0.24 后 odom 落到离地约 0.34m，
+# 检测带 0.24~0.44m 覆盖躯干，低于 0.2m 的门槛/台阶则交给腿部跨越。
 # prettier-ignore
 lidar_R_body: [1.0, 0.0, 0.0,
                0.0, 1.0, 0.0,
                0.0, 0.0, 1.0]
-lidar_t_body: [0.0, 0.0, 0.0]
+lidar_t_body: [0.0, 0.0, -0.24]

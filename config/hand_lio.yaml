@@ -15,7 +15,7 @@ world_frame_id: world
 vehicle_frame_id: body
 
 blind:
-  0.8 # 盲区半径 [m]，靠近雷达中心的点直接丢弃
+  0.35 # 盲区半径 [m]，靠近雷达中心的点直接丢弃
   # Mid-360 硬件本身盲区只有 0.1~0.2m，但 Elevator-LIO 的
   # mapping.yaml / relocation.yaml 实际用的是 0.8——多出来的部分
   # 是自身支架/外壳造成的自遮挡，跟着同款硬件的实测值走更靠谱

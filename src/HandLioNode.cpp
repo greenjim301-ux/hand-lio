@@ -355,15 +355,29 @@ namespace hand_lio
         //
         // 复制点不加抖动：grid_map 的 setCacheOccupancy 是按点计数的，同一个坐标
         // 重复 N 次就是 N 个 hit，抖动没有额外收益，只会让 rviz 里看着更乱。
+        // 先把份数算出来并一次性 reserve, 再 push。cloud 在 processFrame 里只按真实
+        // 点数 reserve 过, 直接 push 四万个点会触发好几次扩容, 每次都把整个 buffer
+        // (最后有 60000*32B ≈ 1.9MB)复制一遍 —— 实测这部分占了注入开销的一多半。
+        std::vector<int> copies_of(visible.size(), 0);
+        int planned = 0;
+        for (size_t k = 0; k < visible.size() && planned < virtual_obstacle_max_points_; ++k)
+        {
+            const double r2 = std::max(range2[visible[k]], 1e-4);
+            int c = static_cast<int>(std::lround(virtual_obstacle_density_gain_ / r2));
+            c = std::min(std::max(c, 1), virtual_obstacle_max_copies_);
+            c = std::min(c, virtual_obstacle_max_points_ - planned);
+            copies_of[k] = c;
+            planned += c;
+        }
+        cloud.reserve(cloud.size() + static_cast<size_t>(planned));
+
         int budget = virtual_obstacle_max_points_;
         pcl::PointXYZI out;
         out.intensity = 0.0f;
-        for (const size_t i : visible)
+        for (size_t k = 0; k < visible.size(); ++k)
         {
-            const double r2 = std::max(range2[i], 1e-4);
-            int copies = static_cast<int>(std::lround(virtual_obstacle_density_gain_ / r2));
-            copies = std::min(std::max(copies, 1), virtual_obstacle_max_copies_);
-            copies = std::min(copies, budget);
+            const size_t i = visible[k];
+            const int copies = copies_of[k];
             if (copies <= 0)
                 break;
             out.x = pts[i].p.x();

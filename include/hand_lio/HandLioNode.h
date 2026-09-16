@@ -22,6 +22,7 @@
 #pragma once
 
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -101,8 +102,11 @@ private:
         Eigen::Vector3f p = Eigen::Vector3f::Zero();
         Eigen::Vector3f n = Eigen::Vector3f::Zero();  // 零向量 = 没给法向, 不剔除
     };
+    // shared_ptr 而不是直接放 vector: 每帧要读它, 直接拷一份的话 11.6 万点就是
+    // 每帧 2.8MB 的 memcpy(10Hz = 28MB/s), 纯浪费。改成在锁里只拷一个指针, 扫描
+    // 在锁外做; 回调整个换一个新的 shared_ptr, 老的等最后一个读者用完自己释放。
     mutable std::mutex virtual_obstacle_mutex_;
-    std::vector<VirtualObstaclePoint> virtual_obstacle_pts_;
+    std::shared_ptr<const std::vector<VirtualObstaclePoint>> virtual_obstacle_pts_;
 
     // ---- 外参：lidar -> imu ----
     // Mid-360 内置 IMU 相对雷达原点的出厂固定偏移，取自 Elevator-LIO yaml/sensors/livox.yaml，

@@ -278,24 +278,28 @@ namespace hand_lio
             return;
         }
 
+        const size_t n_kept = pts.size();
+        auto shared = std::make_shared<const std::vector<VirtualObstaclePoint>>(std::move(pts));
         {
             std::lock_guard<std::mutex> lock(virtual_obstacle_mutex_);
-            virtual_obstacle_pts_.swap(pts);
+            virtual_obstacle_pts_ = std::move(shared);
         }
         // 空点云是正常状态（没有禁行区 / 全删了），照收不误，把上一批清掉。
-        ROS_INFO("[hand_lio] virtual obstacles updated: %zu points", virtual_obstacle_pts_.size());
+        ROS_INFO("[hand_lio] virtual obstacles updated: %zu points", n_kept);
     }
 
     void HandLioNode::appendVirtualObstacles(const Eigen::Vector3d &sensor_pos,
                                              pcl::PointCloud<pcl::PointXYZI> &cloud) const
     {
-        std::vector<VirtualObstaclePoint> pts;
+        std::shared_ptr<const std::vector<VirtualObstaclePoint>> cache;
         {
             std::lock_guard<std::mutex> lock(virtual_obstacle_mutex_);
-            if (virtual_obstacle_pts_.empty())
-                return;
-            pts = virtual_obstacle_pts_;
+            cache = virtual_obstacle_pts_;
         }
+        if (!cache || cache->empty())
+            return;
+        const std::vector<VirtualObstaclePoint> &pts = *cache;
+        const ros::WallTime t_begin = ros::WallTime::now();
 
         // ---- 1) 量程剔除 ----
         // 超过 grid_map 的 max_ray_length 的点它本来也不会当成有效命中来用, 发过去
@@ -374,6 +378,12 @@ namespace hand_lio
             ROS_WARN_THROTTLE(5.0, "[hand_lio] virtual obstacle injection hit the %d-point budget, wall may be thinned",
                               virtual_obstacle_max_points_);
         }
+        // 上机排查"墙没出现"时要能一眼看出是哪一环: 缓存里有多少、这一帧过了多少、
+        // 注入了多少、花了多久。节流到 5s 一条, 正常跑的时候不吵。
+        ROS_INFO_THROTTLE(5.0,
+                          "[hand_lio] virtual obstacles: cached=%zu visible=%zu injected=%d took=%.2fms",
+                          pts.size(), visible.size(), virtual_obstacle_max_points_ - budget,
+                          (ros::WallTime::now() - t_begin).toSec() * 1e3);
     }
 
     void HandLioNode::processFrame(const PendingFrame &frame)

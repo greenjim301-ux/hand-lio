@@ -1,6 +1,9 @@
 #include "hand_lio/HandLioNode.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <unordered_map>
 #include <vector>
 
 #include <geometry_msgs/TransformStamped.h>
@@ -64,6 +67,12 @@ namespace hand_lio
         pnh.param("world_frame_id", world_frame_id_, world_frame_id_);
         pnh.param("vehicle_frame_id", vehicle_frame_id_, vehicle_frame_id_);
         pnh.param("n_scans", n_scans_, n_scans_);
+        pnh.param("enable_virtual_obstacles", enable_virtual_obstacles_, enable_virtual_obstacles_);
+        pnh.param("virtual_obstacle_topic", virtual_obstacle_topic_, virtual_obstacle_topic_);
+        pnh.param("virtual_obstacle_max_range", virtual_obstacle_max_range_, virtual_obstacle_max_range_);
+        pnh.param("virtual_obstacle_density_gain", virtual_obstacle_density_gain_, virtual_obstacle_density_gain_);
+        pnh.param("virtual_obstacle_max_copies", virtual_obstacle_max_copies_, virtual_obstacle_max_copies_);
+        pnh.param("virtual_obstacle_max_points", virtual_obstacle_max_points_, virtual_obstacle_max_points_);
 
         std::string lidar_topic = "/livox/lidar";
         std::string odom_topic = "/latest_imu_odom";
@@ -79,10 +88,19 @@ namespace hand_lio
         lidar_sub_ = nh.subscribe(lidar_topic, 10, &HandLioNode::lidarCallback, this);
         cloud_pub_ = nh.advertise<sensor_msgs::PointCloud2>(output_topic, 10);
         vehicle_odom_pub_ = nh.advertise<nav_msgs::Odometry>(vehicle_odom_topic, 200);
+        if (enable_virtual_obstacles_)
+        {
+            // 对面是 latched 的，队列 1 就够：连上立刻收到当前这一份，之后只有
+            // 用户改禁行区才会再发。
+            virtual_obstacle_sub_ =
+                nh.subscribe(virtual_obstacle_topic_, 1, &HandLioNode::virtualObstacleCallback, this);
+        }
 
         ROS_INFO_STREAM("[hand_lio] lidar_topic=" << lidar_topic << " odom_topic=" << odom_topic << " output_topic="
                                                   << output_topic << " vehicle_odom_topic=" << vehicle_odom_topic
-                                                  << " world_frame_id=" << world_frame_id_);
+                                                  << " world_frame_id=" << world_frame_id_
+                                                  << " virtual_obstacles="
+                                                  << (enable_virtual_obstacles_ ? virtual_obstacle_topic_ : std::string("off")));
     }
 
     void HandLioNode::odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
@@ -188,6 +206,176 @@ namespace hand_lio
         }
     }
 
+    void HandLioNode::virtualObstacleCallback(const sensor_msgs::PointCloud2ConstPtr &msg)
+    {
+        // navibot 只发 xyz float32（见它的 ros_bridge.publish_virtual_obstacles），
+        // 但别假设字段顺序/步长，按 fields 里的 offset 取，多一个 intensity 之类也不会错。
+        int off_x = -1, off_y = -1, off_z = -1;
+        int off_nx = -1, off_ny = -1, off_nz = -1;
+        for (const auto &f : msg->fields)
+        {
+            if (f.datatype != sensor_msgs::PointField::FLOAT32)
+                continue;
+            if (f.name == "x")
+                off_x = static_cast<int>(f.offset);
+            else if (f.name == "y")
+                off_y = static_cast<int>(f.offset);
+            else if (f.name == "z")
+                off_z = static_cast<int>(f.offset);
+            else if (f.name == "normal_x")
+                off_nx = static_cast<int>(f.offset);
+            else if (f.name == "normal_y")
+                off_ny = static_cast<int>(f.offset);
+            else if (f.name == "normal_z")
+                off_nz = static_cast<int>(f.offset);
+        }
+        const bool has_normal = (off_nx >= 0 && off_ny >= 0 && off_nz >= 0);
+        if (off_x < 0 || off_y < 0 || off_z < 0 || msg->point_step == 0)
+        {
+            ROS_WARN_THROTTLE(1.0, "[hand_lio] virtual obstacle cloud has no float32 x/y/z, ignore");
+            return;
+        }
+
+        const size_t n = static_cast<size_t>(msg->width) * msg->height;
+        std::vector<VirtualObstaclePoint> pts;
+        pts.reserve(n);
+        for (size_t i = 0; i < n; ++i)
+        {
+            const uint8_t *base = msg->data.data() + i * msg->point_step;
+            VirtualObstaclePoint vp;
+            std::memcpy(&vp.p.x(), base + off_x, 4);
+            std::memcpy(&vp.p.y(), base + off_y, 4);
+            std::memcpy(&vp.p.z(), base + off_z, 4);
+            if (!vp.p.allFinite())
+                continue;
+            if (has_normal)
+            {
+                std::memcpy(&vp.n.x(), base + off_nx, 4);
+                std::memcpy(&vp.n.y(), base + off_ny, 4);
+                std::memcpy(&vp.n.z(), base + off_nz, 4);
+                if (!vp.n.allFinite())
+                    vp.n.setZero();
+            }
+            pts.push_back(vp);
+        }
+        if (!has_normal && n > 0)
+        {
+            // 没有法向就没法做背面剔除, 整圈墙会全注入 —— 射向远侧墙面的光束会
+            // 把近侧的墙投票投没(见 appendVirtualObstacles)。这时候宁可全注入也
+            // 不要全丢: 至少禁行区还有一部分能挡住, 但要吵一点让人发现版本对不上。
+            ROS_WARN_THROTTLE(5.0,
+                              "[hand_lio] virtual obstacle cloud has no normal_x/y/z, backface culling disabled "
+                              "(navibot too old?)");
+        }
+
+        // frame_id 必须是世界系：这些点直接就当 map 系点用，不做任何变换。对不上
+        // 就整批丢掉——静默接受会在地图上凭空造出一堵位置完全错误的墙。
+        if (!msg->header.frame_id.empty() && msg->header.frame_id != world_frame_id_)
+        {
+            ROS_WARN_THROTTLE(5.0,
+                              "[hand_lio] virtual obstacle frame_id '%s' != world_frame_id '%s', ignore this cloud",
+                              msg->header.frame_id.c_str(), world_frame_id_.c_str());
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(virtual_obstacle_mutex_);
+            virtual_obstacle_pts_.swap(pts);
+        }
+        // 空点云是正常状态（没有禁行区 / 全删了），照收不误，把上一批清掉。
+        ROS_INFO("[hand_lio] virtual obstacles updated: %zu points", virtual_obstacle_pts_.size());
+    }
+
+    void HandLioNode::appendVirtualObstacles(const Eigen::Vector3d &sensor_pos,
+                                             pcl::PointCloud<pcl::PointXYZI> &cloud) const
+    {
+        std::vector<VirtualObstaclePoint> pts;
+        {
+            std::lock_guard<std::mutex> lock(virtual_obstacle_mutex_);
+            if (virtual_obstacle_pts_.empty())
+                return;
+            pts = virtual_obstacle_pts_;
+        }
+
+        // ---- 1) 量程剔除 ----
+        // 超过 grid_map 的 max_ray_length 的点它本来也不会当成有效命中来用, 发过去
+        // 只是白占带宽。
+
+        // ---- 2) 背面剔除 ----
+        // **这一步不能省。** navibot 发的是整圈闭合的墙(它不知道机器人在哪)。原样
+        // 全注入的话, 从传感器射向**远侧**墙面的那些光束会穿过**近侧**墙面所在的
+        // 体素, 给近侧记上 miss —— grid_map 每个更新周期按
+        // count_hit >= count_hit_and_miss - count_hit 投票(grid_map.cpp:664),
+        // 自己的点把自己的墙投没了。真实的墙不会这样: 雷达根本看不见墙背面。
+        //
+        // 判据就是经典的背面剔除: 法向朝着传感器(dot > 0)才留。navibot 给每个点带
+        // 了朝外法向(见它的 virtual_obstacles._outward_normals)。
+        //
+        // 试过按 (方位角, 俯仰角) 分桶做深度缓冲, 不行: 桶要比墙面采样的角间距粗
+        // 才挡得住, 而那个角间距随距离变 —— 2m 处 0.025m 的采样张 0.72°, 比雷达
+        // 自己的角分辨率还粗, 光束直接从近侧点之间漏过去。合成数据上实测远侧墙
+        // 192 个点一个没剔掉。背面剔除没有这个尺度问题, 也不需要跨仓库对齐常数。
+        //
+        // 残留的情况(凹多边形自遮挡、一块挡住另一块)只会多注入一点点, 方向是
+        // "墙更结实", 不会反过来把墙投没。
+        std::vector<size_t> visible;
+        std::vector<double> range2(pts.size(), 0.0);
+        visible.reserve(pts.size());
+        const double max_r2 = virtual_obstacle_max_range_ * virtual_obstacle_max_range_;
+        for (size_t i = 0; i < pts.size(); ++i)
+        {
+            const Eigen::Vector3d to_sensor = sensor_pos - pts[i].p.cast<double>();
+            const double r2 = to_sensor.squaredNorm();
+            range2[i] = r2;
+            if (r2 > max_r2 || r2 < 1e-4)
+                continue;
+            // 法向是零向量(navibot 没给 / 退化多边形)时不剔除, 宁可多注入
+            if (pts[i].n.squaredNorm() > 1e-6 && pts[i].n.cast<double>().dot(to_sensor) <= 0.0)
+                continue;
+            visible.push_back(i);
+        }
+        if (visible.empty())
+            return;
+
+        // ---- 3) 按距离加密 ----
+        // grid_map 的投票展开就是 `注入点数 >= 穿过该体素的真实光束数`。虚拟墙所在
+        // 的位置现实里是空的，每帧都有真实光束穿过去打到后面的地面，每条贡献一个
+        // miss。真实光束密度 ∝ 1/r²，所以注入份数也按 1/r² 来：density_gain 就是
+        // "1m 处每个可见点复制几份"。
+        //
+        // 默认 12 的来历：Mid-360 约 2 万点/帧、FOV 360°x59°(≈5.7 sr) → 约 3500
+        // 点/sr；一个 0.05m 的体素在 1m 处张 (0.05/1)² = 2.5e-3 sr，约 8.7 条光束
+        // 穿过，取 12 留一点余量。**这是按包络算的，没在真机上量过** —— 上机第一
+        // 件事就是看虚拟墙在 grid_map 里稳不稳（/grid_map/occupancy 里那堵墙会不会
+        // 一闪一闪），不稳就把这个数调大。
+        //
+        // 复制点不加抖动：grid_map 的 setCacheOccupancy 是按点计数的，同一个坐标
+        // 重复 N 次就是 N 个 hit，抖动没有额外收益，只会让 rviz 里看着更乱。
+        int budget = virtual_obstacle_max_points_;
+        pcl::PointXYZI out;
+        out.intensity = 0.0f;
+        for (const size_t i : visible)
+        {
+            const double r2 = std::max(range2[i], 1e-4);
+            int copies = static_cast<int>(std::lround(virtual_obstacle_density_gain_ / r2));
+            copies = std::min(std::max(copies, 1), virtual_obstacle_max_copies_);
+            copies = std::min(copies, budget);
+            if (copies <= 0)
+                break;
+            out.x = pts[i].p.x();
+            out.y = pts[i].p.y();
+            out.z = pts[i].p.z();
+            for (int k = 0; k < copies; ++k)
+                cloud.push_back(out);
+            budget -= copies;
+        }
+        if (budget <= 0)
+        {
+            ROS_WARN_THROTTLE(5.0, "[hand_lio] virtual obstacle injection hit the %d-point budget, wall may be thinned",
+                              virtual_obstacle_max_points_);
+        }
+    }
+
     void HandLioNode::processFrame(const PendingFrame &frame)
     {
         const CustomMsgConstPtr &msg = frame.msg;
@@ -258,6 +446,30 @@ namespace hand_lio
 
         if (cloud_world.empty())
             return;
+
+        // 把 navibot 圈的禁行区混进来，让 SCAN-Planner 的局部避障也看得见（它自己
+        // 的实时栅格图不知道那些区域，沟这种负障碍更是压根没有占据体素）。
+        //
+        // **必须混在同一条消息里**，不能另开一路发到同一个话题：grid_map 的
+        // cloudCallback 每次是从 proj_points_cnt = 0 开始**覆盖** md_.proj_points_
+        // （不累加），而 updateOccupancyCallback 是定时器、每次只消费最近那一帧 ——
+        // 另发一路会把真实雷达帧顶掉，是安全倒退。混在这里还顺带保证了 stamp 和
+        // /grid_map/sensor_pose 天然对齐，不会有中继节点那种一帧错位。
+        //
+        // 放在 empty 判断之后：真实点一个都没有的帧本来就该丢，不能只靠虚拟点
+        // 凭空造出一帧来。
+        if (enable_virtual_obstacles_)
+        {
+            PoseSample pose_end;
+            if (interpolatePose(frame.end_time, pose_end))
+            {
+                // 用雷达原点而不是 IMU 原点：可见性剔除是"从雷达看过去"的几何，
+                // 两者差几厘米，算上也不费事。
+                const Eigen::Vector3d lidar_origin = pose_end.q * imu_t_lidar_ + pose_end.p;
+                appendVirtualObstacles(lidar_origin, cloud_world);
+            }
+        }
+
         cloud_world.width = cloud_world.size();
         cloud_world.height = 1;
         cloud_world.is_dense = true;

@@ -55,3 +55,30 @@ lidar_R_body: [1.0, 0.0, 0.0,
                0.0, 1.0, 0.0,
                0.0, 0.0, 1.0]
 lidar_t_body: [0.0, 0.0, 0.0]
+
+# ---- 虚拟障碍注入 ----
+# navibot 把用户在 2D 栅格图上圈的禁行区采样成世界系点云发过来（见它的
+# backend/app/virtual_obstacles.py），本节点混进输出点云，让 SCAN-Planner 的局部
+# 避障也看得见。本节点不认识"禁行区"这个概念，只负责把别人给的障碍点混进来。
+#
+# **为什么非得混在同一条消息里**：grid_map 的 cloudCallback 每次是从
+# proj_points_cnt = 0 开始覆盖 md_.proj_points_（不累加），updateOccupancyCallback
+# 是定时器、每次只消费最近那一帧。往同一个话题另发一路会把真实雷达帧顶掉。
+enable_virtual_obstacles: true
+virtual_obstacle_topic: /navibot/virtual_obstacles # navibot 发的 latched 世界系点云
+
+virtual_obstacle_max_range:
+  5.0 # [m] 超过这个距离的虚拟点不注入。跟 SCAN-Planner 的
+  # grid_map/max_ray_length 对齐——再远它也不会当成有效命中
+
+virtual_obstacle_density_gain:
+  12 # 1m 处每个可见点复制几份，按 1/r² 缩放。grid_map 每个更新
+  # 周期按 count_hit >= count_hit_and_miss - count_hit 投票
+  # （grid_map.cpp:664），展开就是"注入点数 >= 穿过该体素的真实
+  # 光束数"；真实光束密度 ∝ 1/r²，所以注入份数也按 1/r²。
+  # 12 的来历：Mid-360 约 2 万点/帧、FOV 360°x59°(≈5.7 sr) → 约
+  # 3500 点/sr，一个 0.05m 体素在 1m 处张 2.5e-3 sr ≈ 8.7 条光束，
+  # 取 12 留余量。**按包络算的，没在真机上量过** —— 上机先看
+  # /grid_map/occupancy 里那堵墙稳不稳，一闪一闪就调大
+virtual_obstacle_max_copies: 32 # 单点复制份数上限，防止贴脸时爆点
+virtual_obstacle_max_points: 40000 # 每帧注入点数上限（Mid-360 一帧约 2 万点）

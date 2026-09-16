@@ -24,9 +24,12 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <Eigen/Geometry>
 #include <nav_msgs/Odometry.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <tf2_ros/transform_broadcaster.h>
@@ -56,6 +59,13 @@ private:
     void odomCallback(const nav_msgs::Odometry::ConstPtr& msg);
     void lidarCallback(const CustomMsgConstPtr& msg);
 
+    // 缓存 navibot 发来的虚拟障碍点（世界系，latched，只在用户改禁行区时更新）。
+    void virtualObstacleCallback(const sensor_msgs::PointCloud2ConstPtr& msg);
+
+    // 把缓存里"从 sensor_pos 看得见、且在量程内"的虚拟障碍点追加到本帧点云。
+    // 见 .cpp 里的实现说明——为什么要可见性剔除、为什么要按距离加密。
+    void appendVirtualObstacles(const Eigen::Vector3d& sensor_pos, pcl::PointCloud<pcl::PointXYZI>& cloud) const;
+
     // 处理待处理队列：队首帧已被 odom 覆盖到帧尾、或等待超时，则出队处理。
     // 调用者需持有 odom_mutex_。
     void drainPendingFrames();
@@ -74,6 +84,7 @@ private:
 
     ros::Subscriber odom_sub_;
     ros::Subscriber lidar_sub_;
+    ros::Subscriber virtual_obstacle_sub_;
     ros::Publisher cloud_pub_;
     ros::Publisher vehicle_odom_pub_;
     tf2_ros::TransformBroadcaster tf_broadcaster_;
@@ -81,6 +92,17 @@ private:
     mutable std::mutex odom_mutex_;
     std::deque<PoseSample> odom_buf_;
     std::deque<PendingFrame> pending_frames_;
+
+    // 虚拟障碍缓存单独一把锁：它的写入在 navibot 那条回调上（很少发生），读取在
+    // 点云处理路径上，跟 odom_mutex_ 保护的东西没有任何交集，共用一把锁只会让
+    // 10Hz 的点云路径白白跟 200Hz 的 odom 回调抢锁。
+    // 位置 + 朝外法向, 法向用来做背面剔除(见 .cpp 的 appendVirtualObstacles)。
+    struct VirtualObstaclePoint {
+        Eigen::Vector3f p = Eigen::Vector3f::Zero();
+        Eigen::Vector3f n = Eigen::Vector3f::Zero();  // 零向量 = 没给法向, 不剔除
+    };
+    mutable std::mutex virtual_obstacle_mutex_;
+    std::vector<VirtualObstaclePoint> virtual_obstacle_pts_;
 
     // ---- 外参：lidar -> imu ----
     // Mid-360 内置 IMU 相对雷达原点的出厂固定偏移，取自 Elevator-LIO yaml/sensors/livox.yaml，
@@ -104,6 +126,18 @@ private:
     double pending_timeout_sec_ = 0.5;  // 队首帧等待 odom 覆盖的最长墙钟时长，超时按当前覆盖尽力处理
     std::string world_frame_id_ = "world";
     std::string vehicle_frame_id_ = "body";
+
+    // ---- 虚拟障碍注入 ----
+    // navibot 把用户在 2D 图上圈的禁行区采样成世界系点云发过来（见它的
+    // backend/app/virtual_obstacles.py），这里混进输出点云，让 SCAN-Planner 的
+    // 局部避障也看得见——本节点不认识"禁行区"这个概念，只负责把别人给的障碍点
+    // 混进来。为什么非得混在同一条消息里（而不是另发一路）见 .cpp 的说明。
+    bool enable_virtual_obstacles_ = true;
+    std::string virtual_obstacle_topic_ = "/navibot/virtual_obstacles";
+    double virtual_obstacle_max_range_ = 5.0;   // 跟 SCAN-Planner grid_map/max_ray_length 对齐
+    double virtual_obstacle_density_gain_ = 12; // 1m 处每个可见点复制几份，见 .cpp
+    int virtual_obstacle_max_copies_ = 32;
+    int virtual_obstacle_max_points_ = 40000;   // 每帧注入点数上限，兜底
 
     // Livox tag/line 质量过滤：跟 Elevator-LIO 一样无条件开启，不留开关。
     int n_scans_ = 4;  // Mid-360 专属: livox_ros_driver2 src/comm/comm.h kLineNumberMid360 = 4（line 取值 0~3）

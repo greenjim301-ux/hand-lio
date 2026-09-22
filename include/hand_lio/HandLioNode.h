@@ -55,6 +55,9 @@ private:
         CustomMsgConstPtr msg;
         double end_time = 0.0;        // 帧尾最后一个点的采集时刻
         ros::Time arrival_wall_time;  // 到达本节点的墙钟时刻，用于超时兜底
+        // 已经夹到 msg->points.size() 的点数。**遍历 msg->points 必须用这个**，
+        // 不要再去读 msg->point_num —— 那是上游声称的值，比实际带的点多就越界。
+        int point_num = 0;
     };
 
     void odomCallback(const nav_msgs::Odometry::ConstPtr& msg);
@@ -70,6 +73,12 @@ private:
     // 处理待处理队列：队首帧已被 odom 覆盖到帧尾、或等待超时，则出队处理。
     // 调用者需持有 odom_mutex_。
     void drainPendingFrames();
+
+    // 把点云打包成紧凑的 16 字节 PointCloud2(x/y/z/intensity)。不用 pcl::toROSMsg——
+    // 那个照搬 pcl::PointXYZI 的 32 字节布局, 一半是没有字段声明、也没人写过的
+    // 填充字节(实测是未初始化堆内存)。见 .cpp 里的说明。
+    static void packXYZI(const pcl::PointCloud<pcl::PointXYZI>& cloud,
+                         sensor_msgs::PointCloud2& out);
 
     // 去畸变 + 转 map 系 + 发布。调用者需持有 odom_mutex_。
     void processFrame(const PendingFrame& frame);

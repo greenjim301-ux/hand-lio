@@ -116,9 +116,14 @@ namespace hand_lio
 
         {
             std::lock_guard<std::mutex> lock(odom_mutex_);
-            if (!odom_buf_.empty() && s.t <= odom_buf_.back().t)
+            if (!odom_buf_.empty() && s.t < odom_buf_.back().t)
             {
-                // 时间戳回退（例如播包重播），历史插值区间已经不连续，清空重新累积
+                // 判据是**严格**回退。重复的时间戳是无害的：interpolatePose 的
+                // span > 1e-9 已经挡住了零长度区间，lower_bound 对非递减序列（含
+                // 重复值）也照样正确。用 <= 的话，一条重复位姿（回放循环、上游
+                // 重发同一帧）就会连 pending_frames_ 一起清掉，把在途的那帧雷达
+                // 直接丢了——清空之后 processFrame 的覆盖检查必然不通过。
+                // 只有严格回退才真的让历史插值区间不连续，那时才该清。
                 ROS_WARN_THROTTLE(1.0, "[hand_lio] /latest_imu_odom timestamp went backwards, clearing pose buffer");
                 odom_buf_.clear();
                 pending_frames_.clear();
@@ -163,13 +168,24 @@ namespace hand_lio
 
     void HandLioNode::lidarCallback(const CustomMsgConstPtr &msg)
     {
-        const int point_num = static_cast<int>(msg->point_num);
-        if (point_num <= 1 || msg->points.empty())
+        // point_num 是消息自己声称的点数，processFrame 拿它当 msg->points[i] 的上界。
+        // 声称的比实际带的多就会越界读，所以在入口就夹到 points.size()，
+        // 后面那一路不用再各自防一遍。
+        const size_t declared = msg->point_num;
+        if (declared > msg->points.size())
+        {
+            ROS_WARN_THROTTLE(1.0, "[hand_lio] lidar frame claims %zu points but carries %zu, clamping",
+                              declared, msg->points.size());
+        }
+        const int point_num = static_cast<int>(std::min(declared, msg->points.size()));
+        if (point_num <= 1)
             return;
 
         PendingFrame frame;
         frame.msg = msg;
-        frame.end_time = msg->header.stamp.toSec() + static_cast<double>(msg->points.back().offset_time) * 1e-9;
+        frame.point_num = point_num;
+        frame.end_time = msg->header.stamp.toSec() +
+                         static_cast<double>(msg->points[point_num - 1].offset_time) * 1e-9;
         frame.arrival_wall_time = ros::Time::now();
 
         std::lock_guard<std::mutex> lock(odom_mutex_);
@@ -236,7 +252,31 @@ namespace hand_lio
             return;
         }
 
-        const size_t n = static_cast<size_t>(msg->width) * msg->height;
+        // width/height 和各字段 offset 全来自消息本身，必须当不可信输入校验：
+        // 越界的 offset 会读到下一个点甚至缓冲区外，而 data 短于声明的点数时
+        // base 直接跑飞。上面只校验了"有没有 x/y/z"，挡不住这两种。
+        const int max_off = std::max({off_x, off_y, off_z,
+                                      has_normal ? off_nx : 0,
+                                      has_normal ? off_ny : 0,
+                                      has_normal ? off_nz : 0});
+        if (max_off + 4 > static_cast<int>(msg->point_step))
+        {
+            ROS_WARN_THROTTLE(1.0,
+                              "[hand_lio] virtual obstacle cloud field offset %d+4 exceeds point_step %u, ignore",
+                              max_off, msg->point_step);
+            return;
+        }
+
+        size_t n = static_cast<size_t>(msg->width) * msg->height;
+        const size_t n_fit = msg->data.size() / msg->point_step;
+        if (n > n_fit)
+        {
+            ROS_WARN_THROTTLE(1.0,
+                              "[hand_lio] virtual obstacle cloud claims %zu points but data holds only %zu, truncating",
+                              n, n_fit);
+            n = n_fit;
+        }
+
         std::vector<VirtualObstaclePoint> pts;
         pts.reserve(n);
         for (size_t i = 0; i < n; ++i)
@@ -400,10 +440,44 @@ namespace hand_lio
                           (ros::WallTime::now() - t_begin).toSec() * 1e3);
     }
 
+    void HandLioNode::packXYZI(const pcl::PointCloud<pcl::PointXYZI> &cloud,
+                               sensor_msgs::PointCloud2 &out)
+    {
+        // 不用 pcl::toROSMsg：sizeof(pcl::PointXYZI) 是 32，它照搬内存布局，于是
+        // point_step=32 而只声明 x@0 y@4 z@8 intensity@16 —— offset 12 那 4 字节
+        // （PCL 的 data[3]，构造函数塞的 1.0f）和尾部 20..31 那 12 字节没有任何
+        // 字段声明，也没有任何一行代码写过。实测尾部就是未初始化的堆内存，指针
+        // 形状的值都能直接读出来：既让同一段输入两次跑出的字节不一样（没法做
+        // 校验和比对），又把 12/32 的带宽花在没人要的字节上。
+        // 这里手工打包成紧凑的 16 字节，两个问题一起消掉。
+        out.fields.clear();
+        out.fields.resize(4);
+        const char *names[4] = {"x", "y", "z", "intensity"};
+        for (int i = 0; i < 4; ++i)
+        {
+            out.fields[i].name = names[i];
+            out.fields[i].offset = static_cast<uint32_t>(4 * i);
+            out.fields[i].datatype = sensor_msgs::PointField::FLOAT32;
+            out.fields[i].count = 1;
+        }
+        out.height = 1;
+        out.width = static_cast<uint32_t>(cloud.size());
+        out.point_step = 16;
+        out.row_step = out.point_step * out.width;
+        out.is_bigendian = false;
+        out.is_dense = cloud.is_dense;
+        out.data.resize(static_cast<size_t>(out.row_step));
+        for (size_t i = 0; i < cloud.size(); ++i)
+        {
+            float v[4] = {cloud[i].x, cloud[i].y, cloud[i].z, cloud[i].intensity};
+            std::memcpy(out.data.data() + i * 16, v, 16);
+        }
+    }
+
     void HandLioNode::processFrame(const PendingFrame &frame)
     {
         const CustomMsgConstPtr &msg = frame.msg;
-        const int point_num = static_cast<int>(msg->point_num);
+        const int point_num = frame.point_num;   // 已夹过界，见 PendingFrame 的注释
         const double base_time = msg->header.stamp.toSec();
 
         if (odom_buf_.empty() || odom_buf_.front().t > base_time || odom_buf_.back().t < base_time)
@@ -499,7 +573,7 @@ namespace hand_lio
         cloud_world.is_dense = true;
 
         sensor_msgs::PointCloud2 out_msg;
-        pcl::toROSMsg(cloud_world, out_msg);
+        packXYZI(cloud_world, out_msg);
         out_msg.header.stamp = ros::Time(frame.end_time);
         out_msg.header.frame_id = world_frame_id_;
         cloud_pub_.publish(out_msg);

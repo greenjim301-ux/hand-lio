@@ -132,7 +132,11 @@ private:
     Eigen::Vector3d lidar_t_body_ = Eigen::Vector3d::Zero();
 
     // ---- 参数 ----
-    double blind_ = 0.8;  // 跟随 Elevator-LIO 同款 Mid-360 实测值，见 config/hand_lio.yaml 注释
+    // 跟 config/hand_lio.yaml 保持一致。**两处必须同步**：launch 才会加载那个
+    // yaml，直接 rosrun 时用的是这里的默认值——两边不一致的话，同一个节点用
+    // 两种方式启动会跑在不同的盲区半径上，而且不会有任何提示。
+    // 这个值本身该实测，理由见 yaml 里的注释。
+    double blind_ = 0.35;
     int point_filter_num_ = 1;
     double buffer_horizon_sec_ = 2.0;
     double pose_cov_reject_thresh_ = 0.99;

@@ -9,7 +9,7 @@
 #include <geometry_msgs/TransformStamped.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include <pcl_conversions/pcl_conversions.h>
+#include <sensor_msgs/PointCloud2.h>
 
 namespace hand_lio
 {
@@ -255,14 +255,17 @@ namespace hand_lio
         // width/height 和各字段 offset 全来自消息本身，必须当不可信输入校验：
         // 越界的 offset 会读到下一个点甚至缓冲区外，而 data 短于声明的点数时
         // base 直接跑飞。上面只校验了"有没有 x/y/z"，挡不住这两种。
-        const int max_off = std::max({off_x, off_y, off_z,
-                                      has_normal ? off_nx : 0,
-                                      has_normal ? off_ny : 0,
-                                      has_normal ? off_nz : 0});
-        if (max_off + 4 > static_cast<int>(msg->point_step))
+        // 比较必须在 size_t 上做，不能用 int：offset 是 uint32_t，0x7FFFFFFF 转成
+        // int 还是正数、过得了上面的 off_x<0 守卫，而 int 下的 max_off+4 会溢出
+        // (UB，实测回绕成负数)从而小于 point_step，反倒把越界的 offset 放行。
+        const size_t max_off = static_cast<size_t>(std::max({off_x, off_y, off_z,
+                                                             has_normal ? off_nx : 0,
+                                                             has_normal ? off_ny : 0,
+                                                             has_normal ? off_nz : 0}));
+        if (max_off + 4 > static_cast<size_t>(msg->point_step))
         {
             ROS_WARN_THROTTLE(1.0,
-                              "[hand_lio] virtual obstacle cloud field offset %d+4 exceeds point_step %u, ignore",
+                              "[hand_lio] virtual obstacle cloud field offset %zu+4 exceeds point_step %u, ignore",
                               max_off, msg->point_step);
             return;
         }

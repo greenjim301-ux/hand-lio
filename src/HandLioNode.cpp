@@ -83,11 +83,22 @@ namespace hand_lio
         pnh.param("output_topic", output_topic, output_topic);
         pnh.param("vehicle_odom_topic", vehicle_odom_topic, vehicle_odom_topic);
 
-        // /latest_imu_odom 200Hz，缓冲队列要能跟上；/livox/lidar 10Hz。
-        odom_sub_ = nh.subscribe(odom_topic, 2000, &HandLioNode::odomCallback, this);
-        lidar_sub_ = nh.subscribe(lidar_topic, 10, &HandLioNode::lidarCallback, this);
         cloud_pub_ = nh.advertise<sensor_msgs::PointCloud2>(output_topic, 10);
         vehicle_odom_pub_ = nh.advertise<nav_msgs::Odometry>(vehicle_odom_topic, 200);
+
+        // /latest_imu_odom 200Hz，走自己的回调队列和线程（见头文件的"线程"说明），
+        // 这样主线程处理点云时它照样 5ms 一条地转发出去。tcpNoDelay：200Hz 的小包，
+        // 别让 Nagle 攒批。
+        ros::SubscribeOptions odom_ops = ros::SubscribeOptions::create<nav_msgs::Odometry>(
+            odom_topic, 2000, boost::bind(&HandLioNode::odomCallback, this, _1), ros::VoidPtr(), &odom_queue_);
+        odom_ops.transport_hints = ros::TransportHints().tcpNoDelay();
+        odom_sub_ = nh.subscribe(odom_ops);
+        // /livox/lidar 10Hz，留在主线程（全局回调队列）。
+        lidar_sub_ = nh.subscribe(lidar_topic, 10, &HandLioNode::lidarCallback, this);
+        // 队首帧被 odom 覆盖之后要有人来处理它。odom 线程不处理点云，所以主线程
+        // 定时看一眼；5ms 对 10Hz 的点云只是可以忽略的额外延迟。
+        drain_timer_ = nh.createWallTimer(ros::WallDuration(0.005),
+                                          [this](const ros::WallTimerEvent &) { drainPendingFrames(); });
         if (enable_virtual_obstacles_)
         {
             // 对面是 latched 的，队列 1 就够：连上立刻收到当前这一份，之后只有
@@ -101,10 +112,17 @@ namespace hand_lio
                                                   << " world_frame_id=" << world_frame_id_
                                                   << " virtual_obstacles="
                                                   << (enable_virtual_obstacles_ ? virtual_obstacle_topic_ : std::string("off")));
+
+        // 所有订阅/定时器都建好之后再起 odom 线程。
+        odom_spinner_.reset(new ros::AsyncSpinner(1, &odom_queue_));
+        odom_spinner_->start();
     }
 
     void HandLioNode::odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
     {
+        // 先转发：这是下游控制器的反馈，越早越好，不需要锁。
+        publishVehicleOdom(msg);
+
         PoseSample s;
         s.t = msg->header.stamp.toSec();
         s.p = Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
@@ -133,23 +151,21 @@ namespace hand_lio
             {
                 odom_buf_.pop_front();
             }
-            drainPendingFrames();
-        } // odom_mutex_ 在此释放，publishVehicleOdom 不需要它
-
-        publishVehicleOdom(msg);
+        }
+        // 点云不在这里处理：主线程的 drain_timer_ 会发现队首帧已被覆盖。
     }
 
-    bool HandLioNode::interpolatePose(double t, PoseSample &out) const
+    bool HandLioNode::interpolatePose(const std::deque<PoseSample> &buf, double t, PoseSample &out)
     {
-        if (odom_buf_.size() < 2)
+        if (buf.size() < 2)
             return false;
-        if (t < odom_buf_.front().t || t > odom_buf_.back().t)
+        if (t < buf.front().t || t > buf.back().t)
             return false;
 
-        auto it = std::lower_bound(odom_buf_.begin(), odom_buf_.end(), t,
+        auto it = std::lower_bound(buf.begin(), buf.end(), t,
                                    [](const PoseSample &s, double tt)
                                    { return s.t < tt; });
-        if (it == odom_buf_.begin())
+        if (it == buf.begin())
         {
             out = *it;
             return true;
@@ -188,37 +204,60 @@ namespace hand_lio
                          static_cast<double>(msg->points[point_num - 1].offset_time) * 1e-9;
         frame.arrival_wall_time = ros::Time::now();
 
-        std::lock_guard<std::mutex> lock(odom_mutex_);
-        pending_frames_.push_back(frame);
-        // 正常滞后 2~20ms 时队列里最多 1 帧；积压说明 odom 断流已久，只留最新的几帧
-        while (pending_frames_.size() > 5)
         {
-            ROS_WARN_THROTTLE(1.0, "[hand_lio] pending frame queue overflow, dropping oldest lidar frame");
-            pending_frames_.pop_front();
+            std::lock_guard<std::mutex> lock(odom_mutex_);
+            pending_frames_.push_back(frame);
+            // 正常滞后 2~20ms 时队列里最多 1 帧；积压说明 odom 断流已久，只留最新的几帧
+            while (pending_frames_.size() > 5)
+            {
+                ROS_WARN_THROTTLE(1.0, "[hand_lio] pending frame queue overflow, dropping oldest lidar frame");
+                pending_frames_.pop_front();
+            }
         }
         drainPendingFrames();
     }
 
     void HandLioNode::drainPendingFrames()
     {
-        while (!pending_frames_.empty())
+        while (true)
         {
-            const PendingFrame &front = pending_frames_.front();
-            const bool covered = !odom_buf_.empty() && odom_buf_.back().t >= front.end_time;
-            // 实测 /latest_imu_odom 滞后 2~20ms，正常情况下等一两条 odom 就覆盖到帧尾了；
-            // 超时兜底只在 odom 停更时触发：按当前覆盖范围尽力处理，未覆盖的点被
-            // interpolatePose 跳过，行为退化为旧版"到即处理"，不无限积压
-            const bool timed_out = (ros::Time::now() - front.arrival_wall_time).toSec() > pending_timeout_sec_;
-            if (!covered && !timed_out)
-                return;
-            if (timed_out && !covered)
+            PendingFrame frame;
+            std::deque<PoseSample> poses;
+            double latest_cov0 = 0.0;
             {
-                ROS_WARN_THROTTLE(1.0, "[hand_lio] odom did not cover lidar frame end within %.2fs, processing partially",
-                                  pending_timeout_sec_);
+                std::lock_guard<std::mutex> lock(odom_mutex_);
+                if (pending_frames_.empty())
+                    return;
+                const PendingFrame &front = pending_frames_.front();
+                const bool covered = !odom_buf_.empty() && odom_buf_.back().t >= front.end_time;
+                // 实测 /latest_imu_odom 滞后 2~20ms，正常情况下等一两条 odom 就覆盖到帧尾了；
+                // 超时兜底只在 odom 停更时触发：按当前覆盖范围尽力处理，未覆盖的点被
+                // interpolatePose 跳过，行为退化为旧版"到即处理"，不无限积压
+                const bool timed_out = (ros::Time::now() - front.arrival_wall_time).toSec() > pending_timeout_sec_;
+                if (!covered && !timed_out)
+                    return;
+                if (timed_out && !covered)
+                {
+                    ROS_WARN_THROTTLE(1.0, "[hand_lio] odom did not cover lidar frame end within %.2fs, processing partially",
+                                      pending_timeout_sec_);
+                }
+                frame = front;
+                pending_frames_.pop_front();
+
+                // 只拷这一帧用得到的那段：帧头之前的最后一个样本（插值的左端点）到
+                // 缓冲区末尾（含最新一条，给定位质量把关用），200Hz 下也就几十个。
+                if (!odom_buf_.empty())
+                {
+                    const double base_time = frame.msg->header.stamp.toSec();
+                    auto first = std::lower_bound(odom_buf_.begin(), odom_buf_.end(), base_time,
+                                                  [](const PoseSample &s, double tt) { return s.t < tt; });
+                    if (first != odom_buf_.begin())
+                        --first;
+                    poses.assign(first, odom_buf_.end());
+                    latest_cov0 = odom_buf_.back().cov0;
+                }
             }
-            PendingFrame frame = pending_frames_.front();
-            pending_frames_.pop_front();
-            processFrame(frame);
+            processFrame(frame, poses, latest_cov0);
         }
     }
 
@@ -477,28 +516,27 @@ namespace hand_lio
         }
     }
 
-    void HandLioNode::processFrame(const PendingFrame &frame)
+    void HandLioNode::processFrame(const PendingFrame &frame, const std::deque<PoseSample> &poses, double latest_cov0)
     {
         const CustomMsgConstPtr &msg = frame.msg;
         const int point_num = frame.point_num;   // 已夹过界，见 PendingFrame 的注释
         const double base_time = msg->header.stamp.toSec();
 
-        if (odom_buf_.empty() || odom_buf_.front().t > base_time || odom_buf_.back().t < base_time)
+        if (poses.empty() || poses.front().t > base_time || poses.back().t < base_time)
         {
-            if (odom_buf_.empty())
+            if (poses.empty())
             {
                 ROS_WARN_THROTTLE(1.0, "[hand_lio] /latest_imu_odom buffer is empty, drop frame");
             }
             else
             {
                 ROS_WARN_THROTTLE(1.0, "[hand_lio] /latest_imu_odom buffer time range [%.3f, %.3f] does not cover this lidar scan start time %.3f, drop frame",
-                                  odom_buf_.front().t, odom_buf_.back().t, base_time);
+                                  poses.front().t, poses.back().t, base_time);
             }
             return;
         }
 
         // 用缓冲区里最新的样本做定位质量把关
-        const double latest_cov0 = odom_buf_.back().cov0;
         if (latest_cov0 >= pose_cov_reject_thresh_)
         {
             ROS_WARN_THROTTLE(1.0, "[hand_lio] localization covariance too high (%.3f >= %.3f), drop frame", latest_cov0,
@@ -529,7 +567,7 @@ namespace hand_lio
 
             const double t_point = base_time + static_cast<double>(pt.offset_time) * 1e-9;
             PoseSample pose_i;
-            if (!interpolatePose(t_point, pose_i))
+            if (!interpolatePose(poses, t_point, pose_i))
                 continue;
 
             // 去畸变 + 转 map 系一步完成：用该点自己采集时刻的插值位姿直接变换
@@ -562,7 +600,7 @@ namespace hand_lio
         if (enable_virtual_obstacles_)
         {
             PoseSample pose_end;
-            if (interpolatePose(frame.end_time, pose_end))
+            if (interpolatePose(poses, frame.end_time, pose_end))
             {
                 // 用雷达原点而不是 IMU 原点：可见性剔除是"从雷达看过去"的几何，
                 // 两者差几厘米，算上也不费事。

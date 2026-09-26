@@ -9,10 +9,18 @@
  * 丢点问题的解法——延迟处理（deferred processing）：/latest_imu_odom 天然比
  * /livox/lidar 晚到（实测滞后 2~20ms），若在 lidar 回调里立即处理，帧尾最后
  * 几毫秒的点会因插值区间覆盖不到而被丢弃。所以 lidar 帧先进待处理队列，
- * 每收到新 odom 就检查队首帧是否已被完整覆盖（odom_buf_.back().t >= 帧尾时刻），
- * 覆盖了才处理发布。代价只是滞后量级（~25ms）的额外延迟，换来一个点都不丢、
- * 且所有点都用真插值（无外推）。odom 停更时由 pending_timeout_sec 兜底：
- * 超时的帧按当时覆盖范围尽力处理，未覆盖的尾部点丢弃，不无限积压。
+ * 等队首帧被完整覆盖（odom_buf_.back().t >= 帧尾时刻）了才处理发布。代价只是
+ * 滞后量级（~25ms）的额外延迟，换来一个点都不丢、且所有点都用真插值（无外推）。
+ * odom 停更时由 pending_timeout_sec 兜底：超时的帧按当时覆盖范围尽力处理，
+ * 未覆盖的尾部点丢弃，不无限积压。
+ *
+ * 线程：/latest_imu_odom 走自己的回调队列 + 专用 spinner 线程，回调里只做
+ * "发 /hand_lio/odom_vehicle + 追加缓冲区"，不碰点云。点云处理留在主线程
+ * （lidar 回调 + 5ms 定时器检查队首帧），在锁里只拷出这一帧用得到的那段位姿，
+ * 锁外做去畸变。以前两者共用一个单线程 spin、点云还是在 odom 回调里处理的，
+ * 处理一帧期间 200Hz 的位姿全堆在队列里，出来时成批发出（实测 LubanCat-4 上
+ * odom_vehicle 比 /latest_imu_odom 晚 23ms 中位、53ms 最大，4~10 条一批），
+ * 下游 100Hz 的控制器实际只拿到 ~35Hz 的新位姿。
  *
  * 曾试过的桥接方案（用 Elevator-LIO 的去畸变点云 + 系间修正搬到 map 系，
  * 见 git 历史）已放弃：它引入第二套状态估计的全部失效面和算力开销，点云还
@@ -29,6 +37,8 @@
 
 #include <Eigen/Geometry>
 #include <nav_msgs/Odometry.h>
+#include <ros/callback_queue.h>
+#include <ros/spinner.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <ros/ros.h>
@@ -71,7 +81,8 @@ private:
     void appendVirtualObstacles(const Eigen::Vector3d& sensor_pos, pcl::PointCloud<pcl::PointXYZI>& cloud) const;
 
     // 处理待处理队列：队首帧已被 odom 覆盖到帧尾、或等待超时，则出队处理。
-    // 调用者需持有 odom_mutex_。
+    // 只在主线程调用（lidar 回调、drain_timer_）。自己拿 odom_mutex_，只在锁里
+    // 出队 + 拷出这一帧用得到的那段位姿，去畸变在锁外做，不挡 odom 线程。
     void drainPendingFrames();
 
     // 把点云打包成紧凑的 16 字节 PointCloud2(x/y/z/intensity)。不用 pcl::toROSMsg——
@@ -80,24 +91,27 @@ private:
     static void packXYZI(const pcl::PointCloud<pcl::PointXYZI>& cloud,
                          sensor_msgs::PointCloud2& out);
 
-    // 去畸变 + 转 map 系 + 发布。调用者需持有 odom_mutex_。
-    void processFrame(const PendingFrame& frame);
+    // 去畸变 + 转 map 系 + 发布。poses 是 drainPendingFrames 在锁里拷出来的那段
+    // 位姿（覆盖这一帧），latest_cov0 是当时缓冲区最新一条的定位方差。不需要锁。
+    void processFrame(const PendingFrame& frame, const std::deque<PoseSample>& poses, double latest_cov0);
 
-    // 在 [odom_buf_.front().t, odom_buf_.back().t] 范围内对位姿做线性/球面插值。
-    // 调用者需持有 odom_mutex_。
-    bool interpolatePose(double t, PoseSample& out) const;
+    // 在 [buf.front().t, buf.back().t] 范围内对位姿做线性/球面插值。
+    static bool interpolatePose(const std::deque<PoseSample>& buf, double t, PoseSample& out);
 
     // 参照 Elevator-LIO::publish_body_odometry：world_T_body = world_T_imu * imu_T_lidar * lidar_T_body。
     // 这里 world_T_imu 直接取自 /latest_imu_odom 这一条消息本身（不需要插值），
     // 跟去畸变点云那条路径（需要缓冲区插值）是相互独立的两条支路。
     void publishVehicleOdom(const nav_msgs::Odometry::ConstPtr& msg);
 
+    // odom 专用回调队列，必须声明在 odom_sub_ 之前（订阅先析构，队列后析构）。
+    ros::CallbackQueue odom_queue_;
     ros::Subscriber odom_sub_;
     ros::Subscriber lidar_sub_;
     ros::Subscriber virtual_obstacle_sub_;
     ros::Publisher cloud_pub_;
     ros::Publisher vehicle_odom_pub_;
     tf2_ros::TransformBroadcaster tf_broadcaster_;
+    ros::WallTimer drain_timer_;
 
     mutable std::mutex odom_mutex_;
     std::deque<PoseSample> odom_buf_;
@@ -159,6 +173,9 @@ private:
     // Livox tag/line 质量过滤：跟 Elevator-LIO 一样无条件开启，不留开关。
     int n_scans_ = 4;  // Mid-360 专属: livox_ros_driver2 src/comm/comm.h kLineNumberMid360 = 4（line 取值 0~3）
     int tag_mask_ = 0x30;
+
+    // 最后声明 = 最先析构：先停掉 odom 线程，它用到的成员才能放心析构。
+    std::unique_ptr<ros::AsyncSpinner> odom_spinner_;
 };
 
 }  // namespace hand_lio

@@ -29,6 +29,7 @@ add_message_files(
         FILES
         CustomMsg.msg   # 与 /livox/lidar (livox_ros_driver::CustomMsg) 逐字段一致
         CustomPoint.msg
+        PoseFusionDiag.msg   # pose_fusion_shadow_node 的诊断输出
 )
 
 generate_messages(
@@ -66,7 +67,23 @@ target_link_libraries(hand_lio_node
         ${PCL_LIBRARIES}
 )
 
-install(TARGETS hand_lio_node
+# 旁路验证：/lidar_pose 锚点 + 机体速度前推，只发独立话题，不接入控制通路
+add_executable(pose_fusion_shadow_node
+        src/PoseFusionShadowNode.cpp
+        include/hand_lio/PoseFusion.h
+)
+
+add_dependencies(pose_fusion_shadow_node
+        ${${PROJECT_NAME}_EXPORTED_TARGETS}
+        ${catkin_EXPORTED_TARGETS}
+)
+
+target_link_libraries(pose_fusion_shadow_node
+        ${catkin_LIBRARIES}
+        Eigen3::Eigen
+)
+
+install(TARGETS hand_lio_node pose_fusion_shadow_node
         DESTINATION lib/${PROJECT_NAME}
 )
 

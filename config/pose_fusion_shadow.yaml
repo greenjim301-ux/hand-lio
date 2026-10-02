@@ -1,0 +1,55 @@
+# pose_fusion_shadow_node 参数配置
+# 通过 launch/pose_fusion_shadow.launch 以 private (~) 命名空间加载
+#
+# 节点职责（详见 include/hand_lio/PoseFusion.h 头部注释）：
+#   以 /lidar_pose 为锚点、用机体速度从它的消息头时刻前推到当前，输出一条跟
+#   /hand_lio/odom_vehicle 同口径（world -> body）的位姿，仅供并排录包对比。
+#   不发 TF，输出话题没有任何节点订阅。
+
+# ---- 话题 ----
+lidar_pose_topic: /lidar_pose
+cmd_vel_topic: /cmd_vel
+motion_status_topic: /deep_bridge_node/motion_status # deep_bridge 转发的本体运控状态（实测机体速度，10Hz）
+output_topic: /hand_lio/odom_fused_shadow
+diag_topic: /hand_lio/pose_fusion_diag # 每条 /lidar_pose 一条：前推了多久、预测差多少、是否判为跳变
+world_frame_id: world
+vehicle_frame_id: body
+publish_rate: 100.0 # [Hz]
+
+# 外参 lidar_R_body / lidar_t_body 不在这里配，直接读 hand_lio_node 的参数，
+# 保证跟 /hand_lio/odom_vehicle 用同一组值。
+extrinsic_ns: /hand_lio_node
+
+# ---- 速度源 ----
+# cmd_vel:       控制器下发的指令。三条实录 bag (2026-10-01) 离线回放验证过的就是它。
+# motion_status: 本体上报的实测速度。**还没有任何实录数据验证过**——LinearX/LinearY
+#                是不是机体系、符号和量纲对不对，都要靠第一轮旁路录包确认；确认前别切。
+velocity_source: cmd_vel
+
+# 速度源 -> 实际机体速度的比例，两个源分开配。
+cmd_vel_scale:
+  vx: 0.87 # 下楼 bag 上拟合 0.87，上楼 bag 单独拟合 0.90
+  vy: 0.87 # 横移没有单独拟合过，先跟 vx 用同一个值
+  wz: 1.0
+motion_status_scale:
+  vx: 1.0
+  vy: 1.0
+  wz: 1.0
+
+velocity_timeout: 0.5 # [s] 一个速度样本最多用多久，之后按零速。对齐 deep_bridge 的 cmd_timeout_sec
+
+# ---- 融合 ----
+tau: 0.3 # [s] 输出向锚点靠拢的时间常数：把每次 /lidar_pose 到达时的修正量摊开，不留台阶
+slope_window: 1.2 # [s] 用最近多长一段 /lidar_pose 估坡度 dz/ds（z 没有速度源，靠它前推）
+slope_min_ds: 0.15 # [m] 这段水平位移小于它就不估坡度
+slope_max: 0.8 # |dz/ds| 上限
+# /lidar_pose 自身跳变（地图重影/重定位）的判据，判到就让输出直接跟过去、不做平滑，
+# 并在 diag 里标 jump。水平和高度分开判（原因见 PoseFusion.h 文件头）：
+#   水平: |新锚点 - 前推预测| > jump_threshold        （实录回放这个差最大 0.16 m）
+#   高度: |相邻两条 /lidar_pose 的 z 差| > jump_threshold + max_vz * 间隔
+#         （实录里正常相邻 z 差最大 0.20 m，两次真跳变是 1.0 m 和 1.33 m）
+jump_threshold: 0.5 # [m]
+max_vz: 0.5 # [m/s]
+buffer_horizon: 5.0 # [s] 速度样本保留时长，要盖住 /lidar_pose 的最大延迟（实录最大 2.05 s）
+lidar_timeout: 3.0 # [s] /lidar_pose 断流超过它，输出的 covariance[0] 置为 pose_cov_reject_thresh
+pose_cov_reject_thresh: 0.99

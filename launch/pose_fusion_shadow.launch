@@ -1,0 +1,6 @@
+<launch>
+    <!-- 旁路验证节点：只发 /hand_lio/odom_fused_shadow 和 /hand_lio/pose_fusion_diag，不接入控制通路。
+         外参读 /hand_lio_node 的参数，所以要在 hand_lio.launch 之后起。 -->
+    <rosparam file="$(find hand_lio)/config/pose_fusion_shadow.yaml" command="load" ns="pose_fusion_shadow_node"/>
+    <node pkg="hand_lio" type="pose_fusion_shadow_node" name="pose_fusion_shadow_node" output="screen"/>
+</launch>

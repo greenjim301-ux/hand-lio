@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -83,8 +84,39 @@ namespace hand_lio
         pnh.param("output_topic", output_topic, output_topic);
         pnh.param("vehicle_odom_topic", vehicle_odom_topic, vehicle_odom_topic);
 
+        std::string stream_vehicle_odom_topic = "/hand_lio/odom_vehicle_stream";
+        std::string sensor_odom_topic = "/hand_lio/odom_sensor";
+        pnh.param("stream_vehicle_odom_topic", stream_vehicle_odom_topic, stream_vehicle_odom_topic);
+        pnh.param("sensor_odom_topic", sensor_odom_topic, sensor_odom_topic);
+
         cloud_pub_ = nh.advertise<sensor_msgs::PointCloud2>(output_topic, 10);
         vehicle_odom_pub_ = nh.advertise<nav_msgs::Odometry>(vehicle_odom_topic, 200);
+        stream_vehicle_odom_pub_ = nh.advertise<nav_msgs::Odometry>(stream_vehicle_odom_topic, 200);
+        sensor_odom_pub_ = nh.advertise<nav_msgs::Odometry>(sensor_odom_topic, 200);
+
+        std::string pose_source = "stream";
+        pnh.param("pose_source", pose_source, pose_source);
+        if (pose_source != "stream" && pose_source != "fused")
+        {
+            ROS_FATAL("[hand_lio] pose_source must be stream or fused, got '%s'", pose_source.c_str());
+            throw std::runtime_error("bad pose_source");
+        }
+        fused_ = pose_source == "fused";
+        if (fused_)
+        {
+            // 输入侧的回调全挂在 odom_queue_ 上：跟 odomCallback 同一个线程，融合状态不用加锁
+            const FusionFrontend::Config cfg = FusionFrontend::loadConfig(ros::NodeHandle(pnh, "fusion"));
+            frontend_.reset(new FusionFrontend(nh, &odom_queue_, cfg, lidar_R_body_, lidar_t_body_, world_frame_id_));
+            ROS_WARN_STREAM("[hand_lio] pose_source=fused: odom_vehicle / TF / " << sensor_odom_topic
+                            << " / point cloud follow " << cfg.lidar_pose_topic << " + " << cfg.velocity_source
+                            << (cfg.velocity_fallback ? " (fallback " + cfg.cmd_vel_topic + ")" : std::string())
+                            << " propagation, yaw_from_stream=" << cfg.params.yaw_from_stream
+                            << ", tau=" << cfg.params.tau << " s; diag on " << cfg.diag_topic);
+        }
+        else
+        {
+            ROS_INFO("[hand_lio] pose_source=stream: odom_vehicle is composed from %s directly", odom_topic.c_str());
+        }
 
         // /latest_imu_odom 200Hz，走自己的回调队列和线程（见头文件的"线程"说明），
         // 这样主线程处理点云时它照样 5ms 一条地转发出去。tcpNoDelay：200Hz 的小包，
@@ -120,9 +152,6 @@ namespace hand_lio
 
     void HandLioNode::odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
     {
-        // 先转发：这是下游控制器的反馈，越早越好，不需要锁。
-        publishVehicleOdom(msg);
-
         PoseSample s;
         s.t = msg->header.stamp.toSec();
         s.p = Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
@@ -131,6 +160,77 @@ namespace hand_lio
         s.q.normalize();
         // hand-topic.csv: covariance[0] 是定位方差，0.0~0.99，越大越不可信，0.99 表示定位失败
         s.cov0 = msg->pose.covariance[0];
+
+        // 高频流合成的机体位姿。参照 Elevator-LIO::publish_body_odometry：
+        // world_T_body = world_T_imu * imu_T_lidar * lidar_T_body，world_T_imu 直接取自这一条消息。
+        const Eigen::Matrix3d R_world_lidar = s.q.toRotationMatrix() * imu_R_lidar_;
+        const Eigen::Vector3d p_world_lidar = s.q * imu_t_lidar_ + s.p;
+        const Eigen::Matrix3d R_body_s = R_world_lidar * lidar_R_body_;
+        const Eigen::Vector3d p_body_s = R_world_lidar * lidar_t_body_ + p_world_lidar;
+
+        // 世界系修正量 T_corr = T_fused_body * T_stream_body^-1：位置对齐到融合位置，航向转到
+        // 融合航向，横滚/俯仰保留高频流的（200Hz IMU，比 5Hz 的 /lidar_pose 新）。
+        Eigen::Matrix3d R_corr = Eigen::Matrix3d::Identity();
+        Eigen::Vector3d p_corr = Eigen::Vector3d::Zero();
+        if (fused_)
+        {
+            const ros::Time now = ros::Time::now();
+            PoseFusion &fusion = frontend_->fusion();
+            frontend_->resetIfTimeWentBack(now.toSec());
+            // 位置保持帧（位置、姿态跟上一条完全一样）不能当“这段时间没转”用，见 PoseFusion.h
+            const bool fresh = !have_stream_ || (s.p - last_stream_p_).norm() > 1e-9 ||
+                               s.q.angularDistance(last_stream_q_) > 1e-9;
+            last_stream_p_ = s.p;
+            last_stream_q_ = s.q;
+            have_stream_ = true;
+            fusion.addStreamYaw(s.t, FusionFrontend::yawOf(R_body_s), fresh);
+            fusion.advance(now.toSec());
+
+            const bool active = frontend_->active(now);
+            if (active != fused_active_)
+            {
+                if (active)
+                    ROS_WARN("[hand_lio] pose_source=fused: fusion active, odom_vehicle now follows it");
+                else
+                    ROS_WARN("[hand_lio] pose_source=fused: no /lidar_pose for %.1f s, falling back to the raw stream "
+                             "until it is back",
+                             frontend_->lidarSilence(now));
+                fused_active_ = active;
+            }
+            if (active)
+            {
+                const PoseFusion::Pose &fp = fusion.pose();
+                R_corr = Eigen::AngleAxisd(PoseFusion::wrapAngle(fp.yaw - FusionFrontend::yawOf(R_body_s)),
+                                           Eigen::Vector3d::UnitZ())
+                             .toRotationMatrix();
+                p_corr = Eigen::Vector3d(fp.x, fp.y, fp.z) - R_corr * p_body_s;
+            }
+        }
+        s.corr_q = Eigen::Quaterniond(R_corr);
+        s.corr_p = p_corr;
+
+        // 先发位姿：这是下游控制器的反馈，越早越好。
+        if (s.cov0 >= pose_cov_reject_thresh_)
+        {
+            ROS_WARN_THROTTLE(1.0, "[hand_lio] odom_vehicle localization covariance too high (%.3f >= %.3f)", s.cov0,
+                              pose_cov_reject_thresh_);
+        }
+        publishBodyOdom(vehicle_odom_pub_, msg->header.stamp, R_corr * R_body_s, R_corr * p_body_s + p_corr, s.cov0,
+                        true);
+        publishBodyOdom(stream_vehicle_odom_pub_, msg->header.stamp, R_body_s, p_body_s, s.cov0, false);
+
+        // 修正后的 IMU 位姿，坐标系/口径跟 /latest_imu_odom 一样（栅格地图自己再乘它的雷达外参）
+        nav_msgs::Odometry sensor = *msg;
+        const Eigen::Quaterniond q_sensor(R_corr * s.q.toRotationMatrix());
+        const Eigen::Vector3d p_sensor = R_corr * s.p + p_corr;
+        sensor.pose.pose.position.x = p_sensor.x();
+        sensor.pose.pose.position.y = p_sensor.y();
+        sensor.pose.pose.position.z = p_sensor.z();
+        sensor.pose.pose.orientation.w = q_sensor.w();
+        sensor.pose.pose.orientation.x = q_sensor.x();
+        sensor.pose.pose.orientation.y = q_sensor.y();
+        sensor.pose.pose.orientation.z = q_sensor.z();
+        sensor_odom_pub_.publish(sensor);
 
         {
             std::lock_guard<std::mutex> lock(odom_mutex_);
@@ -179,6 +279,8 @@ namespace hand_lio
         out.p = (1.0 - ratio) * lo.p + ratio * hi.p;
         out.q = lo.q.slerp(ratio, hi.q);
         out.cov0 = std::max(lo.cov0, hi.cov0);
+        out.corr_p = (1.0 - ratio) * lo.corr_p + ratio * hi.corr_p;
+        out.corr_q = lo.corr_q.slerp(ratio, hi.corr_q);
         return true;
     }
 
@@ -570,10 +672,11 @@ namespace hand_lio
             if (!interpolatePose(poses, t_point, pose_i))
                 continue;
 
-            // 去畸变 + 转 map 系一步完成：用该点自己采集时刻的插值位姿直接变换
+            // 去畸变 + 转 map 系一步完成：用该点自己采集时刻的插值位姿直接变换，
+            // 再乘同一时刻的修正量（stream 模式下是单位变换）
             const Eigen::Vector3d p_lidar(pt.x, pt.y, pt.z);
             const Eigen::Vector3d p_imu = imu_R_lidar_ * p_lidar + imu_t_lidar_;
-            const Eigen::Vector3d p_world = pose_i.q * p_imu + pose_i.p;
+            const Eigen::Vector3d p_world = pose_i.corr_q * (pose_i.q * p_imu + pose_i.p) + pose_i.corr_p;
 
             pcl::PointXYZI out_pt;
             out_pt.x = static_cast<float>(p_world.x());
@@ -604,7 +707,8 @@ namespace hand_lio
             {
                 // 用雷达原点而不是 IMU 原点：可见性剔除是"从雷达看过去"的几何，
                 // 两者差几厘米，算上也不费事。
-                const Eigen::Vector3d lidar_origin = pose_end.q * imu_t_lidar_ + pose_end.p;
+                const Eigen::Vector3d lidar_origin =
+                    pose_end.corr_q * (pose_end.q * imu_t_lidar_ + pose_end.p) + pose_end.corr_p;
                 appendVirtualObstacles(lidar_origin, cloud_world);
             }
         }
@@ -620,58 +724,37 @@ namespace hand_lio
         cloud_pub_.publish(out_msg);
     }
 
-    void HandLioNode::publishVehicleOdom(const nav_msgs::Odometry::ConstPtr &msg)
+    void HandLioNode::publishBodyOdom(ros::Publisher &pub, const ros::Time &stamp, const Eigen::Matrix3d &R,
+                                      const Eigen::Vector3d &p, double cov0, bool with_tf)
     {
-        // world_T_imu：直接用这一条 /latest_imu_odom 自己的 pose，不需要缓冲区插值
-        Eigen::Matrix4d world_T_imu = Eigen::Matrix4d::Identity();
-        const Eigen::Quaterniond q_world_imu(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
-                                             msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
-        world_T_imu.block<3, 3>(0, 0) = q_world_imu.normalized().toRotationMatrix();
-        world_T_imu.block<3, 1>(0, 3) =
-            Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
-
-        Eigen::Matrix4d imu_T_lidar = Eigen::Matrix4d::Identity();
-        imu_T_lidar.block<3, 3>(0, 0) = imu_R_lidar_;
-        imu_T_lidar.block<3, 1>(0, 3) = imu_t_lidar_;
-
-        Eigen::Matrix4d lidar_T_body = Eigen::Matrix4d::Identity();
-        lidar_T_body.block<3, 3>(0, 0) = lidar_R_body_;
-        lidar_T_body.block<3, 1>(0, 3) = lidar_t_body_;
-
-        // 参照 Elevator-LIO::publish_body_odometry 的合成方式
-        const Eigen::Matrix4d world_T_body = world_T_imu * imu_T_lidar * lidar_T_body;
-        const Eigen::Quaterniond body_q(world_T_body.block<3, 3>(0, 0));
-        const Eigen::Vector3d body_p = world_T_body.block<3, 1>(0, 3);
-
+        const Eigen::Quaterniond q(R);
         nav_msgs::Odometry odom_body;
-        odom_body.header.stamp = msg->header.stamp;
+        odom_body.header.stamp = stamp;
         odom_body.header.frame_id = world_frame_id_;
         odom_body.child_frame_id = vehicle_frame_id_;
-        odom_body.pose.pose.position.x = body_p.x();
-        odom_body.pose.pose.position.y = body_p.y();
-        odom_body.pose.pose.position.z = body_p.z();
-        odom_body.pose.pose.orientation.w = body_q.w();
-        odom_body.pose.pose.orientation.x = body_q.x();
-        odom_body.pose.pose.orientation.y = body_q.y();
-        odom_body.pose.pose.orientation.z = body_q.z();
+        odom_body.pose.pose.position.x = p.x();
+        odom_body.pose.pose.position.y = p.y();
+        odom_body.pose.pose.position.z = p.z();
+        odom_body.pose.pose.orientation.w = q.w();
+        odom_body.pose.pose.orientation.x = q.x();
+        odom_body.pose.pose.orientation.y = q.y();
+        odom_body.pose.pose.orientation.z = q.z();
         // 定位质量透传给下游，而不是直接丢帧：odom_vehicle 是持续反馈给规划/控制的话题，
         // 静默断流比让下游自己判断 covariance[0] 风险更大。twist 保持全零，
         // 跟 Elevator-LIO::publish_body_odometry 实际行为一致（它也从没写过 twist 字段）。
-        odom_body.pose.covariance[0] = msg->pose.covariance[0];
-        if (msg->pose.covariance[0] >= pose_cov_reject_thresh_)
-        {
-            ROS_WARN_THROTTLE(1.0, "[hand_lio] odom_vehicle localization covariance too high (%.3f >= %.3f)",
-                              msg->pose.covariance[0], pose_cov_reject_thresh_);
-        }
-        vehicle_odom_pub_.publish(odom_body);
+        // fused 模式也保持全零：规划器会读 twist（急停退出条件看它），填了就改了规划器的行为。
+        odom_body.pose.covariance[0] = cov0;
+        pub.publish(odom_body);
+        if (!with_tf)
+            return;
 
         geometry_msgs::TransformStamped trans;
-        trans.header.stamp = odom_body.header.stamp;
+        trans.header.stamp = stamp;
         trans.header.frame_id = world_frame_id_;
         trans.child_frame_id = vehicle_frame_id_;
-        trans.transform.translation.x = body_p.x();
-        trans.transform.translation.y = body_p.y();
-        trans.transform.translation.z = body_p.z();
+        trans.transform.translation.x = p.x();
+        trans.transform.translation.y = p.y();
+        trans.transform.translation.z = p.z();
         trans.transform.rotation = odom_body.pose.pose.orientation;
         tf_broadcaster_.sendTransform(trans);
     }

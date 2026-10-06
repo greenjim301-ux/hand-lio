@@ -22,6 +22,21 @@
  * odom_vehicle 比 /latest_imu_odom 晚 23ms 中位、53ms 最大，4~10 条一批），
  * 下游 100Hz 的控制器实际只拿到 ~35Hz 的新位姿。
  *
+ * 位姿来源（pose_source）：
+ *   stream  /hand_lio/odom_vehicle 直接由 /latest_imu_odom 合成（原来的做法）。
+ *   fused   /lidar_pose 做锚点 + 机体速度前推（PoseFusion，输入侧见 FusionFrontend）。
+ *           /latest_imu_odom 的“突变”其实就是 /lidar_pose 到达时的修正，坏的是两次
+ *           修正之间的前推（楼梯上 z 向能偏到 -1~-1.5 m/s，/lidar_pose 延迟超过约 1 s
+ *           时干脆不前推）。融合位姿和高频流之差记成一个世界系修正量
+ *               T_corr(t) = T_fused_body(t) * T_stream_body(t)^-1
+ *           同一个修正量施加到 odom_vehicle、TF、/hand_lio/odom_sensor（栅格地图的射线
+ *           原点）和去畸变后的点云上——只换 odom_vehicle 的话，楼梯上机器人和障碍物的
+ *           高度会差出 0.5~0.9 m（规划器“起点在障碍物里”就是这么来的）。扫描内部的
+ *           相对运动仍用高频流插值（100ms 内它是准的），整帧再按修正量对齐。
+ *           还没有锚点、或 /lidar_pose 断流超过 fusion/lidar_timeout 时，修正量为单位
+ *           变换，行为跟 stream 完全一样。
+ * 两种模式下都另发 /hand_lio/odom_vehicle_stream（高频流合成的机体位姿），录包对比用。
+ *
  * 曾试过的桥接方案（用 Elevator-LIO 的去畸变点云 + 系间修正搬到 map 系，
  * 见 git 历史）已放弃：它引入第二套状态估计的全部失效面和算力开销，点云还
  * 叠了 elio 漂移 + 配对 + 平滑三层误差；在滞后仅 2~20ms 的前提下，延迟处理
@@ -46,6 +61,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 
 #include "hand_lio/CustomMsg.h"
+#include "hand_lio/FusionFrontend.h"
 
 namespace hand_lio {
 
@@ -59,6 +75,10 @@ private:
         Eigen::Quaterniond q = Eigen::Quaterniond::Identity();
         Eigen::Vector3d p = Eigen::Vector3d::Zero();
         double cov0 = 0.0;  // covariance[0]：定位方差，见 hand-topic.csv（<0.1 较高精度，0.99 定位失败）
+        // 这一时刻的世界系修正量 T_corr（见文件头 pose_source=fused），stream 模式下恒为单位变换。
+        // 点云的世界系坐标 = corr_q * (q * p_imu + p) + corr_p
+        Eigen::Quaterniond corr_q = Eigen::Quaterniond::Identity();
+        Eigen::Vector3d corr_p = Eigen::Vector3d::Zero();
     };
 
     struct PendingFrame {
@@ -98,10 +118,9 @@ private:
     // 在 [buf.front().t, buf.back().t] 范围内对位姿做线性/球面插值。
     static bool interpolatePose(const std::deque<PoseSample>& buf, double t, PoseSample& out);
 
-    // 参照 Elevator-LIO::publish_body_odometry：world_T_body = world_T_imu * imu_T_lidar * lidar_T_body。
-    // 这里 world_T_imu 直接取自 /latest_imu_odom 这一条消息本身（不需要插值），
-    // 跟去畸变点云那条路径（需要缓冲区插值）是相互独立的两条支路。
-    void publishVehicleOdom(const nav_msgs::Odometry::ConstPtr& msg);
+    // 发一条 world -> body 的 Odometry（twist 全零）；with_tf 时同时发 TF。
+    void publishBodyOdom(ros::Publisher& pub, const ros::Time& stamp, const Eigen::Matrix3d& R,
+                         const Eigen::Vector3d& p, double cov0, bool with_tf);
 
     // odom 专用回调队列，必须声明在 odom_sub_ 之前（订阅先析构，队列后析构）。
     ros::CallbackQueue odom_queue_;
@@ -110,6 +129,8 @@ private:
     ros::Subscriber virtual_obstacle_sub_;
     ros::Publisher cloud_pub_;
     ros::Publisher vehicle_odom_pub_;
+    ros::Publisher stream_vehicle_odom_pub_;  // 高频流合成的机体位姿，两种模式都发，录包对比用
+    ros::Publisher sensor_odom_pub_;          // 修正后的 IMU 位姿（口径同 /latest_imu_odom），给栅格地图当射线原点
     tf2_ros::TransformBroadcaster tf_broadcaster_;
     ros::WallTimer drain_timer_;
 
@@ -173,6 +194,15 @@ private:
     // Livox tag/line 质量过滤：跟 Elevator-LIO 一样无条件开启，不留开关。
     int n_scans_ = 4;  // Mid-360 专属: livox_ros_driver2 src/comm/comm.h kLineNumberMid360 = 4（line 取值 0~3）
     int tag_mask_ = 0x30;
+
+    // ---- 位姿来源（见文件头）----
+    // 融合相关的东西只在 odom 线程里访问（FusionFrontend 的回调也挂在 odom_queue_ 上），不用锁。
+    bool fused_ = false;
+    std::unique_ptr<FusionFrontend> frontend_;
+    bool fused_active_ = false;  // 上一条位姿用的是不是融合结果，只用来打切换日志
+    bool have_stream_ = false;
+    Eigen::Vector3d last_stream_p_ = Eigen::Vector3d::Zero();
+    Eigen::Quaterniond last_stream_q_ = Eigen::Quaterniond::Identity();
 
     // 最后声明 = 最先析构：先停掉 odom 线程，它用到的成员才能放心析构。
     std::unique_ptr<ros::AsyncSpinner> odom_spinner_;

@@ -10,9 +10,58 @@
 lidar_topic: /livox/lidar
 odom_topic: /latest_imu_odom # 手持设备全局重定位位姿，map->imu，200Hz，见 hand-topic.csv
 output_topic: /hand_lio/clouds_lidar # 去畸变后 map 系点云，SCAN-Planner run.launch 的 cloud_topic 指向它
-vehicle_odom_topic: /hand_lio/odom_vehicle # 由 /latest_imu_odom 合成的机体位姿
+vehicle_odom_topic: /hand_lio/odom_vehicle # 机体位姿，规划器/控制器都订阅它。来源见下面 pose_source
+stream_vehicle_odom_topic: /hand_lio/odom_vehicle_stream # 由 /latest_imu_odom 直接合成的机体位姿，两种模式都发，录包对比用
+sensor_odom_topic: /hand_lio/odom_sensor # 修正后的 IMU 位姿（口径同 /latest_imu_odom），SCAN-Planner 栅格地图的射线原点
 world_frame_id: world
 vehicle_frame_id: body
+
+# ---- 位姿来源 ----
+# stream: odom_vehicle 直接由 /latest_imu_odom 合成（原来的做法）。
+# fused:  /lidar_pose 做锚点 + 机体速度前推。/latest_imu_odom 的“突变”就是 /lidar_pose
+#         到达时的修正，坏的是两次修正之间的前推（楼梯上 z 向能偏到 -1~-1.5 m/s）。
+#         odom_vehicle、TF、odom_sensor、点云用同一个修正量，三者保持一致。
+#         实测（2026-10-06 M20S 上下楼，旁路实跑）：z 误差 90 分位 0.30~0.47 -> 0.10~0.12 m，
+#         水平 0.14~0.15 -> 0.10 m，超过 5cm 的台阶 140~150 次 -> 0。
+#         /lidar_pose 断流超过 fusion/lidar_timeout 时自动退回 stream 的位姿，恢复后再切回。
+# 出问题改回 stream 即可回退，不用动别的。
+pose_source: stream
+
+# pose_source=fused 时的融合参数（pose_fusion_shadow_node 用同样的键名，见它的 yaml）
+fusion:
+  lidar_pose_topic: /lidar_pose
+  diag_topic: /hand_lio/pose_fusion_diag # 每条 /lidar_pose 一条：前推了多久、预测差多少、是否判为跳变
+
+  # 速度源。motion_status: deep_bridge 转发的本体实测机体速度（10Hz）；cmd_vel: 控制器指令。
+  # 实测 motion_status 的 LinearX 就是机身前进速度（比例 0.97~0.98），前推比 cmd_vel 略准，
+  # 而且闭环后不依赖指令：机器狗被挡住时实测速度是零，cmd_vel 不是。
+  velocity_source: motion_status
+  motion_status_topic: /deep_bridge_node/motion_status
+  cmd_vel_topic: /cmd_vel
+  velocity_fallback: true # motion_status 断了就临时用 cmd_vel，恢复后切回
+  velocity_fallback_timeout: 0.5 # [s]
+  velocity_timeout: 0.5 # [s] 一个速度样本最多用多久，之后按零速。对齐 deep_bridge 的 cmd_timeout_sec
+  # 速度源 -> 实际机体速度的比例（用 /lidar_pose 拟合，M20S）
+  motion_status_scale: {vx: 1.0, vy: 1.0, wz: 1.0}
+  cmd_vel_scale: {vx: 0.92, vy: 0.92, wz: 1.0} # 10-06 拟合前进 0.91~0.92；横移样本太少，跟前进用同一个值
+
+  # 航向用高频流（/latest_imu_odom）自己的增量，而不是速度源的角速度积分：前推 1.4 s 的航向
+  # 误差 90 分位 1.3° 对 4~5°。高频流位置保持（冻住）的那一小段自动退回角速度积分。
+  yaw_from_stream: true
+  stream_gap_max: 0.05 # [s] 两条新鲜高频流样本最大间隔，超过按断流处理
+  stream_yaw_rate_max: 20.0 # [rad/s] 只挡离谱的毛刺。别调低：高频流航向有来回 3~4° 的快速抖动，剔掉一半会让航向误差翻倍
+
+  tau: 0.3 # [s] 输出向锚点靠拢的时间常数：把每次 /lidar_pose 到达时的修正量摊开，不留台阶
+  slope_window: 1.2 # [s] 用最近多长一段 /lidar_pose 估坡度 dz/ds（z 没有速度源，靠它前推）
+  slope_min_ds: 0.15 # [m] 这段水平位移小于它就不估坡度
+  slope_max: 0.8 # |dz/ds| 上限
+  # /lidar_pose 自身跳变（地图重影/重定位）的判据，判到就让输出直接跟过去、不做平滑：
+  #   水平: |新锚点 - 前推预测| > jump_threshold
+  #   高度: |相邻两条 /lidar_pose 的 z 差| > jump_threshold + max_vz * 间隔
+  jump_threshold: 0.5 # [m]
+  max_vz: 0.5 # [m/s]
+  buffer_horizon: 5.0 # [s] 速度/航向样本保留时长，要盖住 /lidar_pose 的最大延迟（实录最大 2.05 s）
+  lidar_timeout: 3.0 # [s] /lidar_pose 断流超过它，退回 stream 的位姿
 
 blind:
   0.35 # 盲区半径 [m]，靠近雷达中心的点直接丢弃
